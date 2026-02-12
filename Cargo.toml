@@ -12,6 +12,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 notify = "8"
 rfd = "0.15"
 rayon = "1"
+qoi = "0.4"
 sha2 = "0.10"
 image_hasher = "3"
 dirs-next = "2"

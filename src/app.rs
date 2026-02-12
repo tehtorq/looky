@@ -12,6 +12,7 @@ use crate::thumbnail;
 use crate::viewer::ViewerState;
 
 const THUMBNAIL_BATCH_SIZE: usize = 32;
+const MAX_UPGRADE_BATCHES_IN_FLIGHT: usize = 3;
 const DUP_HASH_BATCH_SIZE: usize = 32;
 const VISUAL_DUP_THRESHOLD: u32 = 10;
 const THUMB_FADE_MS: f32 = 300.0;
@@ -51,6 +52,10 @@ struct Looky {
     image_paths: Vec<PathBuf>,
     thumbnails: Vec<(PathBuf, image::Handle, Instant)>,
     pending_thumbnails: Vec<PathBuf>,
+    // Two-pass loading: path → index in thumbnails vec for O(1) upgrade
+    thumbnail_index: HashMap<PathBuf, usize>,
+    pending_upgrades: Vec<PathBuf>,
+    upgrade_batches_in_flight: usize,
     viewer: ViewerState,
     loading: bool,
     cached_metadata: Option<(usize, PhotoMetadata)>,
@@ -67,6 +72,7 @@ struct Looky {
     dup_summaries: HashMap<usize, metadata::FileSummary>,
     grid_scroll_y: f32,
     grid_columns: usize,
+    viewport_height: f32,
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
 }
@@ -78,6 +84,9 @@ impl Default for Looky {
             image_paths: Vec::new(),
             thumbnails: Vec::new(),
             pending_thumbnails: Vec::new(),
+            thumbnail_index: HashMap::new(),
+            pending_upgrades: Vec::new(),
+            upgrade_batches_in_flight: 0,
             viewer: ViewerState::default(),
             loading: false,
             cached_metadata: None,
@@ -93,6 +102,7 @@ impl Default for Looky {
             dup_summaries: HashMap::new(),
             grid_scroll_y: 0.0,
             grid_columns: 4,
+            viewport_height: 600.0,
             selected_thumb: None,
             viewer_cache: HashMap::new(),
         }
@@ -105,6 +115,8 @@ pub enum Message {
     FolderSelected(Option<PathBuf>),
     ImagesFound(Vec<PathBuf>),
     ThumbnailBatchReady(Vec<(PathBuf, Vec<u8>, u32, u32)>),
+    PreviewBatchReady(Vec<(PathBuf, Option<(Vec<u8>, u32, u32)>)>),
+    ThumbnailUpgradeReady(Vec<(PathBuf, Vec<u8>, u32, u32)>),
     ViewImage(usize),
     NextImage,
     PrevImage,
@@ -124,7 +136,7 @@ pub enum Message {
     BackFromCompare,
     // Navigation
     GridScrolled(f32),
-    WindowResized(f32),
+    WindowResized(f32, f32),
     KeyEscape,
     KeyLeft,
     KeyRight,
@@ -149,7 +161,7 @@ fn subscription(state: &Looky) -> Subscription<Message> {
             }
         }
         iced::Event::Window(iced::window::Event::Resized(size)) => {
-            Some(Message::WindowResized(size.width))
+            Some(Message::WindowResized(size.width, size.height))
         }
         _ => None,
     });
@@ -183,6 +195,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.thumbnails.clear();
             state.image_paths.clear();
             state.pending_thumbnails.clear();
+            state.thumbnail_index.clear();
+            state.pending_upgrades.clear();
+            state.upgrade_batches_in_flight = 0;
             state.viewer = ViewerState::default();
             state.loading = true;
             // Reset dup state on folder change
@@ -249,10 +264,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                         },
                         |(g, s)| Message::CachedDupAnalysisReady(g, s),
                     );
-                    return Task::batch([load_next_batch(state), task]);
+                    return Task::batch([load_next_preview_batch(state), task]);
                 }
             }
-            return load_next_batch(state);
+            return load_next_preview_batch(state);
         }
         Message::ThumbnailBatchReady(results) => {
             let now = Instant::now();
@@ -261,6 +276,52 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state.thumbnails.push((path, handle, now));
             }
             return load_next_batch(state);
+        }
+        Message::PreviewBatchReady(results) => {
+            let now = Instant::now();
+            for (path, maybe_preview) in results {
+                if let Some((rgba, w, h)) = maybe_preview {
+                    // Has EXIF preview — show it immediately, queue for HD upgrade
+                    let handle = image::Handle::from_rgba(w, h, rgba);
+                    let idx = state.thumbnails.len();
+                    state.thumbnail_index.insert(path.clone(), idx);
+                    state.thumbnails.push((path.clone(), handle, now));
+                    state.pending_upgrades.push(path);
+                } else {
+                    // No EXIF preview — needs full decode, queue for upgrade
+                    state.pending_upgrades.push(path);
+                }
+            }
+            // Continue loading previews AND fire upgrade batches
+            let preview_task = load_next_preview_batch(state);
+            let upgrade_task = load_upgrade_batches(state);
+            return Task::batch([preview_task, upgrade_task]);
+        }
+        Message::ThumbnailUpgradeReady(results) => {
+            state.upgrade_batches_in_flight =
+                state.upgrade_batches_in_flight.saturating_sub(1);
+            let now = Instant::now();
+            for (path, rgba, width, height) in results {
+                let handle = image::Handle::from_rgba(width, height, rgba);
+                if let Some(&idx) = state.thumbnail_index.get(&path) {
+                    // Upgrade existing preview in-place
+                    if idx < state.thumbnails.len() {
+                        state.thumbnails[idx] = (path, handle, now);
+                    }
+                } else {
+                    // No preview existed — add new entry
+                    let idx = state.thumbnails.len();
+                    state.thumbnail_index.insert(path.clone(), idx);
+                    state.thumbnails.push((path, handle, now));
+                }
+            }
+            if state.pending_upgrades.is_empty()
+                && state.upgrade_batches_in_flight == 0
+                && state.pending_thumbnails.is_empty()
+            {
+                state.loading = false;
+            }
+            return load_upgrade_batches(state);
         }
         Message::ViewImage(index) => {
             state.selected_thumb = Some(index);
@@ -457,11 +518,13 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         // Navigation
         Message::GridScrolled(y) => {
             state.grid_scroll_y = y;
+            prioritize_upgrades(state);
         }
-        Message::WindowResized(width) => {
+        Message::WindowResized(width, height) => {
             let available = width - GRID_PADDING * 2.0;
             let cols = ((available + 8.0) / THUMB_CELL).max(1.0) as usize;
             state.grid_columns = cols;
+            state.viewport_height = height;
         }
         Message::KeyEscape => {
             if state.viewer.current_index.is_some() {
@@ -554,11 +617,11 @@ fn scroll_to_thumb(state: &Looky, index: usize) -> Task<Message> {
     // If the row is above the current scroll, scroll up to it.
     // If it's below, scroll down so it's visible.
     // We don't know the viewport height exactly, so use a conservative estimate.
+    let viewport = state.viewport_height - 50.0; // subtract toolbar height
     let target = if row_top < state.grid_scroll_y {
         row_top
-    } else if row_bottom > state.grid_scroll_y + 600.0 {
-        // Approximate: keep the row near the bottom of a ~600px viewport
-        row_bottom - 600.0
+    } else if row_bottom > state.grid_scroll_y + viewport {
+        row_bottom - viewport
     } else {
         return Task::none();
     };
@@ -582,6 +645,31 @@ fn restore_grid_scroll(state: &Looky) -> Task<Message> {
     iced::widget::operation::scroll_to(grid_scroll_id(), offset)
 }
 
+fn visible_index_range(state: &Looky) -> std::ops::Range<usize> {
+    let cols = state.grid_columns.max(1);
+    let toolbar_height = 50.0;
+    let first_row = (state.grid_scroll_y / THUMB_CELL).floor().max(0.0) as usize;
+    let visible_rows = ((state.viewport_height - toolbar_height) / THUMB_CELL).ceil() as usize + 1;
+    let first_idx = first_row * cols;
+    let last_idx = ((first_row + visible_rows) * cols).min(state.thumbnails.len());
+    first_idx..last_idx
+}
+
+fn prioritize_upgrades(state: &mut Looky) {
+    if state.pending_upgrades.is_empty() {
+        return;
+    }
+    let visible = visible_index_range(state);
+    let visible_paths: HashSet<&PathBuf> = state.thumbnails[visible]
+        .iter()
+        .map(|(p, _, _)| p)
+        .collect();
+    // Partition: visible first, then rest
+    state
+        .pending_upgrades
+        .sort_by_key(|p| if visible_paths.contains(p) { 0 } else { 1 });
+}
+
 fn load_next_batch(state: &mut Looky) -> Task<Message> {
     if state.pending_thumbnails.is_empty() {
         state.loading = false;
@@ -595,6 +683,36 @@ fn load_next_batch(state: &mut Looky) -> Task<Message> {
         async move { thumbnail::generate_thumbnails_parallel(&batch, 400) },
         Message::ThumbnailBatchReady,
     )
+}
+
+fn load_next_preview_batch(state: &mut Looky) -> Task<Message> {
+    if state.pending_thumbnails.is_empty() {
+        return Task::none();
+    }
+
+    let count = THUMBNAIL_BATCH_SIZE.min(state.pending_thumbnails.len());
+    let batch: Vec<PathBuf> = state.pending_thumbnails.drain(..count).collect();
+
+    Task::perform(
+        async move { thumbnail::extract_previews_parallel(&batch, 400) },
+        Message::PreviewBatchReady,
+    )
+}
+
+fn load_upgrade_batches(state: &mut Looky) -> Task<Message> {
+    let mut tasks = Vec::new();
+    while state.upgrade_batches_in_flight < MAX_UPGRADE_BATCHES_IN_FLIGHT
+        && !state.pending_upgrades.is_empty()
+    {
+        let count = THUMBNAIL_BATCH_SIZE.min(state.pending_upgrades.len());
+        let batch: Vec<PathBuf> = state.pending_upgrades.drain(..count).collect();
+        state.upgrade_batches_in_flight += 1;
+        tasks.push(Task::perform(
+            async move { thumbnail::generate_thumbnails_parallel(&batch, 400) },
+            Message::ThumbnailUpgradeReady,
+        ));
+    }
+    Task::batch(tasks)
 }
 
 fn load_next_dup_batch(state: &mut Looky) -> Task<Message> {
@@ -800,71 +918,105 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
     let thumbnails = &state.thumbnails;
     let badge_set = &state.dup_badge_set;
     let selected = state.selected_thumb;
+    let scroll_y = state.grid_scroll_y;
+    let viewport_h = state.viewport_height;
 
     iced::widget::responsive(move |size| {
         let available = size.width - GRID_PADDING * 2.0;
         let thumbs_per_row = ((available + 8.0) / THUMB_CELL).max(1.0) as usize;
+        let total_rows = (thumbnails.len() + thumbs_per_row - 1) / thumbs_per_row;
 
-        let rows: Vec<Element<Message>> = thumbnails
-            .chunks(thumbs_per_row)
-            .enumerate()
-            .map(|(row_idx, chunk)| {
-                let items: Vec<Element<Message>> = chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, (_path, handle, added))| {
-                        let index = row_idx * thumbs_per_row + col_idx;
-                        let age_ms = added.elapsed().as_secs_f32() * 1000.0;
-                        let opacity = (age_ms / THUMB_FADE_MS).min(1.0);
-                        let img = image(handle.clone())
-                            .width(THUMB_SIZE)
-                            .height(THUMB_SIZE)
-                            .content_fit(iced::ContentFit::Cover)
-                            .opacity(opacity);
+        // Determine visible row range (with 1-row buffer above and below)
+        let first_visible_row = (scroll_y / THUMB_CELL).floor().max(0.0) as usize;
+        let visible_row_count = (viewport_h / THUMB_CELL).ceil() as usize + 2;
+        let first_row = first_visible_row.saturating_sub(1);
+        let last_row = (first_row + visible_row_count + 1).min(total_rows);
 
-                        let thumb_content: Element<'_, Message> =
-                            if badge_set.contains(&index) {
-                                iced::widget::stack![
-                                    img,
+        let mut items: Vec<Element<Message>> = Vec::new();
+
+        // Top spacer for rows above visible range
+        if first_row > 0 {
+            let spacer_height = first_row as f32 * THUMB_CELL;
+            items.push(
+                Space::new()
+                    .width(Length::Fill)
+                    .height(spacer_height)
+                    .into(),
+            );
+        }
+
+        // Render only visible rows
+        for row_idx in first_row..last_row {
+            let start = row_idx * thumbs_per_row;
+            let end = (start + thumbs_per_row).min(thumbnails.len());
+            if start >= thumbnails.len() {
+                break;
+            }
+
+            let row_items: Vec<Element<Message>> = (start..end)
+                .map(|index| {
+                    let (_path, handle, added) = &thumbnails[index];
+                    let age_ms = added.elapsed().as_secs_f32() * 1000.0;
+                    let opacity = (age_ms / THUMB_FADE_MS).min(1.0);
+                    let img = image(handle.clone())
+                        .width(THUMB_SIZE)
+                        .height(THUMB_SIZE)
+                        .content_fit(iced::ContentFit::Cover)
+                        .opacity(opacity);
+
+                    let thumb_content: Element<'_, Message> =
+                        if badge_set.contains(&index) {
+                            iced::widget::stack![
+                                img,
+                                container(
                                     container(
-                                        container(
-                                            text("DUP").size(11).color(Color::WHITE),
-                                        )
-                                        .padding([2, 6])
-                                        .style(dup_badge_style),
+                                        text("DUP").size(11).color(Color::WHITE),
                                     )
-                                    .align_right(THUMB_SIZE)
-                                    .padding(4),
-                                ]
-                                .into()
-                            } else {
-                                img.into()
-                            };
-
-                        let is_selected = selected == Some(index);
-                        let btn = button(thumb_content)
-                            .on_press(Message::ViewImage(index))
-                            .padding(4);
-                        let btn: Element<'_, Message> = if is_selected {
-                            btn.style(button::primary).into()
+                                    .padding([2, 6])
+                                    .style(dup_badge_style),
+                                )
+                                .align_right(THUMB_SIZE)
+                                .padding(4),
+                            ]
+                            .into()
                         } else {
-                            btn.into()
+                            img.into()
                         };
 
-                        if is_selected {
-                            container(btn)
-                                .style(selected_thumb_style)
-                                .into()
-                        } else {
-                            btn
-                        }
-                    })
-                    .collect();
-                row(items).spacing(8).into()
-            })
-            .collect();
+                    let is_selected = selected == Some(index);
+                    let btn = button(thumb_content)
+                        .on_press(Message::ViewImage(index))
+                        .padding(4);
+                    let btn: Element<'_, Message> = if is_selected {
+                        btn.style(button::primary).into()
+                    } else {
+                        btn.into()
+                    };
 
-        column(rows).spacing(8).padding(GRID_PADDING).into()
+                    if is_selected {
+                        container(btn)
+                            .style(selected_thumb_style)
+                            .into()
+                    } else {
+                        btn
+                    }
+                })
+                .collect();
+            items.push(row(row_items).spacing(8).into());
+        }
+
+        // Bottom spacer for rows below visible range
+        if last_row < total_rows {
+            let spacer_height = (total_rows - last_row) as f32 * THUMB_CELL;
+            items.push(
+                Space::new()
+                    .width(Length::Fill)
+                    .height(spacer_height)
+                    .into(),
+            );
+        }
+
+        column(items).spacing(8).padding(GRID_PADDING).into()
     })
     .into()
 }

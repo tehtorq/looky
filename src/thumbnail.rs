@@ -8,19 +8,30 @@ use sha2::{Digest, Sha256};
 /// Generate a thumbnail as RGBA bytes. Returns (rgba_bytes, width, height).
 /// Checks disk cache first; on miss, generates and caches.
 pub fn generate_thumbnail(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
-    // Check disk cache
+    // Check disk cache (QOI format)
     let cache_key = cache_key(path, max_size);
-    if let Some(cache_path) = cache_key.as_ref().and_then(|k| cache_file_path(k)) {
-        if let Ok(img) = image::open(&cache_path) {
-            let (w, h) = img.dimensions();
-            return (img.to_rgba8().into_raw(), w, h);
+    if let Some(key) = cache_key.as_ref() {
+        // Try QOI cache first
+        if let Some(cache_path) = cache_file_path(key) {
+            if let Ok(data) = std::fs::read(&cache_path) {
+                if let Ok((header, pixels)) = qoi::decode_to_vec(&data) {
+                    return (pixels, header.width, header.height);
+                }
+            }
+        }
+        // Fallback: try legacy JPEG cache
+        if let Some(legacy_path) = cache_file_path_legacy(key) {
+            if let Ok(img) = image::open(&legacy_path) {
+                let (w, h) = img.dimensions();
+                return (img.to_rgba8().into_raw(), w, h);
+            }
         }
     }
 
     // Cache miss — generate thumbnail
     let (rgba, w, h) = generate_thumbnail_uncached(path, max_size);
 
-    // Write to disk cache (best-effort)
+    // Write to disk cache (best-effort, QOI format)
     if let Some(key) = cache_key {
         save_to_cache(&key, &rgba, w, h);
     }
@@ -93,6 +104,12 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 fn cache_file_path(key: &str) -> Option<PathBuf> {
     // Use first 2 chars as subdirectory to avoid huge flat directories
     let dir = cache_dir()?.join(&key[..2]);
+    Some(dir.join(format!("{}.qoi", key)))
+}
+
+/// Legacy JPEG cache path for migration fallback.
+fn cache_file_path_legacy(key: &str) -> Option<PathBuf> {
+    let dir = cache_dir()?.join(&key[..2]);
     Some(dir.join(format!("{}.jpg", key)))
 }
 
@@ -103,11 +120,9 @@ fn save_to_cache(key: &str, rgba: &[u8], width: u32, height: u32) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Convert RGBA to RGB JPEG for small file size
-    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec());
-    if let Some(img) = img {
-        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-        let _ = rgb.save_with_format(&path, image::ImageFormat::Jpeg);
+    // QOI encode is ~10x faster than JPEG and keeps RGBA directly
+    if let Ok(data) = qoi::encode_to_vec(rgba, width, height) {
+        let _ = std::fs::write(&path, data);
     }
 }
 
@@ -166,6 +181,30 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
 fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
     let pixels = vec![60u8; (size * size * 4) as usize];
     (pixels, size, size)
+}
+
+/// Fast EXIF thumbnail extraction. Returns (rgba, w, h) or None.
+/// Does NOT check disk cache — that's for the full-quality path.
+pub fn extract_preview(path: &Path, max_size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let (orientation, exif_thumb) = read_exif_info(path);
+    let data = exif_thumb?;
+    let img = image::load_from_memory(&data).ok()?;
+    let thumb = img.resize(max_size, max_size, FilterType::Triangle);
+    let thumb = apply_orientation(thumb, orientation);
+    let (w, h) = thumb.dimensions();
+    Some((thumb.to_rgba8().into_raw(), w, h))
+}
+
+/// Extract EXIF previews for multiple paths in parallel.
+pub fn extract_previews_parallel(
+    paths: &[PathBuf],
+    max_size: u32,
+) -> Vec<(PathBuf, Option<(Vec<u8>, u32, u32)>)> {
+    use rayon::prelude::*;
+    paths
+        .par_iter()
+        .map(|p| (p.clone(), extract_preview(p, max_size)))
+        .collect()
 }
 
 /// Generate thumbnails for multiple paths in parallel using rayon.

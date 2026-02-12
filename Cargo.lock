@@ -2311,6 +2311,7 @@ dependencies = [
  "kamadak-exif",
  "log",
  "notify",
+ "qoi",
  "rayon",
  "rfd",
  "rusqlite",
