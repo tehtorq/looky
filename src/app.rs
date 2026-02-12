@@ -280,17 +280,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::PreviewBatchReady(results) => {
             let now = Instant::now();
             for (path, maybe_preview) in results {
-                if let Some((rgba, w, h)) = maybe_preview {
-                    // Has EXIF preview — show it immediately, queue for HD upgrade
-                    let handle = image::Handle::from_rgba(w, h, rgba);
-                    let idx = state.thumbnails.len();
-                    state.thumbnail_index.insert(path.clone(), idx);
-                    state.thumbnails.push((path.clone(), handle, now));
-                    state.pending_upgrades.push(path);
+                let idx = state.thumbnails.len();
+                state.thumbnail_index.insert(path.clone(), idx);
+                let handle = if let Some((rgba, w, h)) = maybe_preview {
+                    image::Handle::from_rgba(w, h, rgba)
                 } else {
-                    // No EXIF preview — needs full decode, queue for upgrade
-                    state.pending_upgrades.push(path);
-                }
+                    // Placeholder — will be replaced by upgrade batch
+                    image::Handle::from_rgba(1, 1, vec![60, 60, 60, 255])
+                };
+                state.thumbnails.push((path.clone(), handle, now));
+                state.pending_upgrades.push(path);
             }
             // Continue loading previews AND fire upgrade batches
             let preview_task = load_next_preview_batch(state);
@@ -304,15 +303,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             for (path, rgba, width, height) in results {
                 let handle = image::Handle::from_rgba(width, height, rgba);
                 if let Some(&idx) = state.thumbnail_index.get(&path) {
-                    // Upgrade existing preview in-place
                     if idx < state.thumbnails.len() {
                         state.thumbnails[idx] = (path, handle, now);
                     }
-                } else {
-                    // No preview existed — add new entry
-                    let idx = state.thumbnails.len();
-                    state.thumbnail_index.insert(path.clone(), idx);
-                    state.thumbnails.push((path, handle, now));
                 }
             }
             if state.pending_upgrades.is_empty()
@@ -780,7 +773,8 @@ fn view(state: &Looky) -> Element<'_, Message> {
             let has_prev = index > 0;
             let has_next = index + 1 < state.image_paths.len();
 
-            let current_handle = state.viewer_cache.get(&index);
+            let current_handle = state.viewer_cache.get(&index)
+                .or_else(|| state.thumbnails.get(index).map(|(_, h, _)| h));
 
             let fade_from = state.viewer.transition.as_ref().and_then(|t| {
                 let progress = state.viewer.transition_progress().unwrap_or(1.0);
