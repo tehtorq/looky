@@ -1,0 +1,185 @@
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use image::imageops::FilterType;
+use image::{DynamicImage, GenericImageView};
+use sha2::{Digest, Sha256};
+
+/// Generate a thumbnail as RGBA bytes. Returns (rgba_bytes, width, height).
+/// Checks disk cache first; on miss, generates and caches.
+pub fn generate_thumbnail(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
+    // Check disk cache
+    let cache_key = cache_key(path, max_size);
+    if let Some(cache_path) = cache_key.as_ref().and_then(|k| cache_file_path(k)) {
+        if let Ok(img) = image::open(&cache_path) {
+            let (w, h) = img.dimensions();
+            return (img.to_rgba8().into_raw(), w, h);
+        }
+    }
+
+    // Cache miss — generate thumbnail
+    let (rgba, w, h) = generate_thumbnail_uncached(path, max_size);
+
+    // Write to disk cache (best-effort)
+    if let Some(key) = cache_key {
+        save_to_cache(&key, &rgba, w, h);
+    }
+
+    (rgba, w, h)
+}
+
+fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
+    let (orientation, exif_thumb) = read_exif_info(path);
+
+    // Try embedded EXIF thumbnail first (fast — avoids full decode).
+    // Only use it if it's large enough to avoid blurry upscaling.
+    if let Some(data) = exif_thumb {
+        if let Ok(img) = image::load_from_memory(&data) {
+            let (w, h) = img.dimensions();
+            if w.min(h) >= max_size {
+                let thumb = img.resize(max_size, max_size, FilterType::Lanczos3);
+                let thumb = apply_orientation(thumb, orientation);
+                let (w, h) = thumb.dimensions();
+                return (thumb.to_rgba8().into_raw(), w, h);
+            }
+        }
+    }
+
+    // Fallback: full decode + resize
+    match image::open(path) {
+        Ok(img) => {
+            let thumb = img.resize(max_size, max_size, FilterType::Lanczos3);
+            let thumb = apply_orientation(thumb, orientation);
+            let (w, h) = thumb.dimensions();
+            (thumb.to_rgba8().into_raw(), w, h)
+        }
+        Err(e) => {
+            log::warn!("Failed to load image {}: {}", path.display(), e);
+            placeholder_thumbnail(max_size)
+        }
+    }
+}
+
+// --- Disk cache ---
+
+fn cache_dir() -> Option<PathBuf> {
+    dirs_next::home_dir().map(|d| d.join(".looky").join("cache").join("thumbnails"))
+}
+
+/// Build a cache key from canonical path + file size + mtime + max_size.
+fn cache_key(path: &Path, max_size: u32) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let canonical = std::fs::canonicalize(path).ok()?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    hasher.update(mtime.to_le_bytes());
+    hasher.update(max_size.to_le_bytes());
+    let hash = hasher.finalize();
+    Some(hex_encode(hash))
+}
+
+fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn cache_file_path(key: &str) -> Option<PathBuf> {
+    // Use first 2 chars as subdirectory to avoid huge flat directories
+    let dir = cache_dir()?.join(&key[..2]);
+    Some(dir.join(format!("{}.jpg", key)))
+}
+
+fn save_to_cache(key: &str, rgba: &[u8], width: u32, height: u32) {
+    let Some(path) = cache_file_path(key) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Convert RGBA to RGB JPEG for small file size
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec());
+    if let Some(img) = img {
+        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+        let _ = rgb.save_with_format(&path, image::ImageFormat::Jpeg);
+    }
+}
+
+// --- EXIF ---
+
+/// Single file open + EXIF parse: returns (orientation, optional embedded thumbnail JPEG bytes).
+fn read_exif_info(path: &Path) -> (u32, Option<Vec<u8>>) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return (1, None);
+    };
+    let mut reader = BufReader::new(file);
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut reader) else {
+        return (1, None);
+    };
+
+    let orientation = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .unwrap_or(1);
+
+    let thumbnail = (|| {
+        let offset = exif
+            .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
+            .value
+            .get_uint(0)? as u64;
+        let length = exif
+            .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
+            .value
+            .get_uint(0)? as usize;
+        if length == 0 || length > 1_000_000 {
+            return None;
+        }
+        reader.seek(SeekFrom::Start(offset)).ok()?;
+        let mut data = vec![0u8; length];
+        reader.read_exact(&mut data).ok()?;
+        Some(data)
+    })();
+
+    (orientation, thumbnail)
+}
+
+/// Apply EXIF orientation transform to an image.
+fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
+    match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img, // 1 = normal, or unknown
+    }
+}
+
+fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
+    let pixels = vec![60u8; (size * size * 4) as usize];
+    (pixels, size, size)
+}
+
+/// Generate thumbnails for multiple paths in parallel using rayon.
+pub fn generate_thumbnails_parallel(
+    paths: &[std::path::PathBuf],
+    max_size: u32,
+) -> Vec<(std::path::PathBuf, Vec<u8>, u32, u32)> {
+    use rayon::prelude::*;
+
+    paths
+        .par_iter()
+        .map(|p| {
+            let (rgba, w, h) = generate_thumbnail(p, max_size);
+            (p.clone(), rgba, w, h)
+        })
+        .collect()
+}

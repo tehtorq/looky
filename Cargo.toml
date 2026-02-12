@@ -1,0 +1,24 @@
+[package]
+name = "looky"
+version = "0.1.0"
+edition = "2024"
+description = "A photo viewer and organizer"
+
+[dependencies]
+iced = { version = "0.14", features = ["image", "smol"] }
+image = "0.25"
+kamadak-exif = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "8"
+rfd = "0.15"
+rayon = "1"
+sha2 = "0.10"
+image_hasher = "3"
+dirs-next = "2"
+log = "0.4"
+env_logger = "0.11"
+
+# Optimize all dependencies even in debug builds.
+# Pure-Rust image decoders are 10-50x slower without this.
+[profile.dev.package."*"]
+opt-level = 2
