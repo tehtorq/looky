@@ -319,11 +319,13 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::NextImage => {
             state.viewer.next(state.image_paths.len());
+            state.selected_thumb = state.viewer.current_index;
             refresh_metadata(state);
             return preload_viewer_images(state);
         }
         Message::PrevImage => {
             state.viewer.prev();
+            state.selected_thumb = state.viewer.current_index;
             refresh_metadata(state);
             return preload_viewer_images(state);
         }
@@ -536,6 +538,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::KeyLeft => {
             if state.viewer.current_index.is_some() {
                 state.viewer.prev();
+                state.selected_thumb = state.viewer.current_index;
                 refresh_metadata(state);
                 return preload_viewer_images(state);
             } else if !state.dup_view_active && state.dup_compare.is_none() {
@@ -545,6 +548,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::KeyRight => {
             if state.viewer.current_index.is_some() {
                 state.viewer.next(state.image_paths.len());
+                state.selected_thumb = state.viewer.current_index;
                 refresh_metadata(state);
                 return preload_viewer_images(state);
             } else if !state.dup_view_active && state.dup_compare.is_none() {
@@ -576,8 +580,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                     && state.dup_compare.is_none()
                     && idx < state.thumbnails.len()
                 {
+                    state.selected_thumb = Some(idx);
                     state.viewer.open_index(idx);
                     refresh_metadata(state);
+                    return preload_viewer_images(state);
                 }
             }
         }
@@ -832,7 +838,9 @@ fn view(state: &Looky) -> Element<'_, Message> {
             Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
             Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
             Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
-            Key::Named(Named::Enter) => Some(Message::KeyEnter),
+            Key::Named(Named::Enter) | Key::Named(Named::Space) => {
+                Some(Message::KeyEnter)
+            }
             Key::Named(Named::Escape) => Some(Message::KeyEscape),
             _ => None,
         }
@@ -1041,22 +1049,16 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
                         };
 
                     let is_selected = selected == Some(index);
-                    let btn = button(thumb_content)
-                        .on_press(Message::ViewImage(index))
-                        .padding(4);
-                    let btn: Element<'_, Message> = if is_selected {
-                        btn.style(button::primary).into()
+                    let style = if is_selected {
+                        thumb_button_selected
                     } else {
-                        btn.into()
+                        thumb_button_normal
                     };
-
-                    if is_selected {
-                        container(btn)
-                            .style(selected_thumb_style)
-                            .into()
-                    } else {
-                        btn
-                    }
+                    button(thumb_content)
+                        .on_press(Message::ViewImage(index))
+                        .padding(4)
+                        .style(style)
+                        .into()
                 })
                 .collect();
             items.push(row(row_items).spacing(8).into());
@@ -1078,15 +1080,24 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
     .into()
 }
 
-fn selected_thumb_style(theme: &Theme) -> container::Style {
+fn thumb_button_normal(_theme: &Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: None,
+        border: iced::Border::default(),
+        ..button::Style::default()
+    }
+}
+
+fn thumb_button_selected(theme: &Theme, _status: button::Status) -> button::Style {
     let palette = theme.palette();
-    container::Style {
+    button::Style {
+        background: None,
         border: iced::Border {
             color: palette.primary,
-            width: 2.0,
+            width: 3.0,
             radius: 4.0.into(),
         },
-        ..Default::default()
+        ..button::Style::default()
     }
 }
 
