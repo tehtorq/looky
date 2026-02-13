@@ -5,7 +5,7 @@ edition = "2024"
 description = "A photo viewer and organizer"
 
 [dependencies]
-iced = { version = "0.14", features = ["image", "smol"] }
+iced = { version = "0.14", features = ["image", "smol", "advanced"] }
 image = "0.25"
 kamadak-exif = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -7,6 +7,7 @@ use iced::{Color, Element, Length, Subscription, Task, Theme};
 
 use crate::catalog::{self, Catalog};
 use crate::duplicates::{self, DuplicateGroup, ImageHashes, MatchKind};
+use crate::key_listener::KeyListener;
 use crate::metadata::{self, PhotoMetadata};
 use crate::thumbnail;
 use crate::viewer::ViewerState;
@@ -78,7 +79,6 @@ struct Looky {
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
-    last_viewer_handle: Option<image::Handle>,
 }
 
 impl Default for Looky {
@@ -111,7 +111,6 @@ impl Default for Looky {
             selected_thumb: None,
             viewer_cache: HashMap::new(),
             viewer_preload_handles: Vec::new(),
-            last_viewer_handle: None,
         }
     }
 }
@@ -153,20 +152,9 @@ pub enum Message {
 }
 
 fn subscription(state: &Looky) -> Subscription<Message> {
+    // Window resize still goes through subscription (not latency-sensitive).
+    // Keyboard events are handled by KeyListener widget for instant response.
     let events = iced::event::listen_with(|event, _status, _window| match event {
-        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) => {
-            use iced::keyboard::key::Named;
-            use iced::keyboard::Key;
-            match key {
-                Key::Named(Named::ArrowLeft) => Some(Message::KeyLeft),
-                Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
-                Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
-                Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
-                Key::Named(Named::Enter) => Some(Message::KeyEnter),
-                Key::Named(Named::Escape) => Some(Message::KeyEscape),
-                _ => None,
-            }
-        }
         iced::Event::Window(iced::window::Event::Resized(size)) => {
             Some(Message::WindowResized(size.width, size.height))
         }
@@ -343,7 +331,6 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewer.close();
             state.cached_metadata = None;
             state.viewer_cache.clear();
-            state.last_viewer_handle = None;
             return restore_grid_scroll(state);
         }
         Message::ToggleInfo => {
@@ -352,7 +339,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ViewerImageLoaded(index, rgba, width, height) => {
             log::debug!("viewer: [{}] loaded ({}x{})", index, width, height);
             let handle = image::Handle::from_rgba(width, height, rgba);
-            state.viewer_cache.insert(index, handle.clone());
+            state.viewer_cache.insert(index, handle);
             // Evict distant entries to limit memory (keep ±3 of current)
             if let Some(current) = state.viewer.current_index {
                 let keep_min = current.saturating_sub(3);
@@ -360,9 +347,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state
                     .viewer_cache
                     .retain(|&k, _| k >= keep_min && k <= keep_max);
-                // Update last displayed handle when current image arrives
+                // Current image just arrived — now preload neighbors
                 if index == current {
-                    state.last_viewer_handle = Some(handle);
                     return preload_viewer_neighbors(state);
                 }
             }
@@ -834,26 +820,35 @@ fn refresh_metadata(state: &mut Looky) {
 }
 
 fn view(state: &Looky) -> Element<'_, Message> {
+    let content = view_inner(state);
+    KeyListener::new(content, |key, repeat| {
+        if repeat {
+            return None;
+        }
+        use iced::keyboard::key::Named;
+        use iced::keyboard::Key;
+        match key {
+            Key::Named(Named::ArrowLeft) => Some(Message::KeyLeft),
+            Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
+            Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
+            Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
+            Key::Named(Named::Enter) => Some(Message::KeyEnter),
+            Key::Named(Named::Escape) => Some(Message::KeyEscape),
+            _ => None,
+        }
+    })
+    .into()
+}
+
+fn view_inner(state: &Looky) -> Element<'_, Message> {
     // 1. Single-image viewer
     if let Some(index) = state.viewer.current_index {
         if let Some(path) = state.image_paths.get(index) {
             let has_prev = index > 0;
             let has_next = index + 1 < state.image_paths.len();
 
-            let current_handle = state.viewer_cache.get(&index)
-                .or_else(|| state.thumbnails.get(index).map(|(_, h, _)| h))
-                .or(state.last_viewer_handle.as_ref());
-
-            let fade_from = state.viewer.transition.as_ref().and_then(|t| {
-                let progress = state.viewer.transition_progress().unwrap_or(1.0);
-                if progress < 1.0 {
-                    let from_path = state.image_paths.get(t.from_index)?;
-                    let from_handle = state.viewer_cache.get(&t.from_index);
-                    Some((from_path, from_handle, progress))
-                } else {
-                    None
-                }
-            });
+            let full_handle = state.viewer_cache.get(&index);
+            let thumb_handle = state.thumbnails.get(index).map(|(_, h, _)| h);
 
             let meta = if state.viewer.show_info {
                 state.cached_metadata.as_ref().map(|(_, m)| m)
@@ -863,12 +858,12 @@ fn view(state: &Looky) -> Element<'_, Message> {
 
             return viewer_view(
                 path,
-                current_handle,
+                thumb_handle,
+                full_handle,
                 index,
                 state.image_paths.len(),
                 has_prev,
                 has_next,
-                fade_from,
                 meta,
             );
         }
@@ -1291,40 +1286,55 @@ fn duplicates_compare_view<'a>(state: &'a Looky, group: &'a DuplicateGroup) -> E
 
 fn viewer_view<'a>(
     path: &'a PathBuf,
-    current_handle: Option<&'a image::Handle>,
+    thumb_handle: Option<&'a image::Handle>,
+    full_handle: Option<&'a image::Handle>,
     index: usize,
     total: usize,
     has_prev: bool,
     has_next: bool,
-    fade_from: Option<(&'a PathBuf, Option<&'a image::Handle>, f32)>,
     meta: Option<&'a PhotoMetadata>,
 ) -> Element<'a, Message> {
-    let new_img = viewer_image(path, current_handle)
-        .content_fit(iced::ContentFit::Contain)
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-    let image_layer: Element<'a, Message> =
-        if let Some((from_path, from_handle, progress)) = fade_from {
-            // Old image on top fading out, new image underneath at full opacity.
-            // This way the fade-out starts immediately even if the new image
-            // hasn't loaded yet (it just reveals the dark background).
-            let old_img = viewer_image(from_path, from_handle)
+    // Layer thumbnail underneath full-res so there's never a blank frame.
+    // The thumbnail shows immediately; full-res paints on top when ready.
+    let image_layer: Element<'a, Message> = match (full_handle, thumb_handle) {
+        (Some(full), Some(thumb)) => {
+            // Both available: stack thumb behind full-res for seamless swap
+            let thumb_img = image(thumb.clone())
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
-                .height(Length::Fill)
-                .opacity(1.0 - progress);
-
+                .height(Length::Fill);
+            let full_img = image(full.clone())
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill);
             iced::widget::stack![
-                container(new_img).center(Length::Fill),
-                container(old_img).center(Length::Fill),
+                container(thumb_img).center(Length::Fill),
+                container(full_img).center(Length::Fill),
             ]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
-        } else {
-            container(new_img).center(Length::Fill).into()
-        };
+        }
+        (Some(full), None) => {
+            let full_img = image(full.clone())
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            container(full_img).center(Length::Fill).into()
+        }
+        (None, Some(thumb)) => {
+            let thumb_img = image(thumb.clone())
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            container(thumb_img).center(Length::Fill).into()
+        }
+        (None, None) => {
+            container(Space::new())
+                .center(Length::Fill)
+                .into()
+        }
+    };
 
     let filename = path
         .file_name()
@@ -1402,16 +1412,6 @@ fn viewer_view<'a>(
     };
 
     column![toolbar, body,].into()
-}
-
-fn viewer_image(
-    path: &PathBuf,
-    handle: Option<&image::Handle>,
-) -> iced::widget::Image<image::Handle> {
-    match handle {
-        Some(h) => image(h.clone()),
-        None => image(path.to_string_lossy().to_string()),
-    }
 }
 
 const LABEL_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.55);

@@ -1,6 +1,7 @@
 mod app;
 mod catalog;
 mod duplicates;
+mod key_listener;
 mod metadata;
 mod thumbnail;
 mod viewer;
