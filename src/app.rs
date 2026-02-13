@@ -144,6 +144,8 @@ pub enum Message {
     BackFromCompare,
     // Zoom
     ToggleZoom,
+    CenterZoomScroll,
+    ZoomAdjust(f32),
     ZoomScrolled(f32, f32),
     // Navigation
     GridScrolled(f32),
@@ -166,7 +168,9 @@ fn subscription(state: &Looky) -> Subscription<Message> {
         _ => None,
     });
 
-    let needs_tick = state.viewer.is_transitioning() || thumbnails_fading(state);
+    let needs_tick = state.viewer.is_transitioning()
+        || state.viewer.is_zoom_animating()
+        || thumbnails_fading(state);
     if needs_tick {
         Subscription::batch([
             events,
@@ -367,6 +371,11 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::Tick => {
             state.viewer.tick();
+            let crossed_threshold = state.viewer.tick_zoom();
+            if crossed_threshold {
+                // Scrollable just appeared — defer centering by one frame
+                return Task::done(Message::CenterZoomScroll);
+            }
         }
         // Duplicate detection
         Message::FindDuplicates => {
@@ -523,10 +532,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         // Zoom
         Message::ToggleZoom => {
             if state.viewer.current_index.is_some() {
+                // Sets zoom_target; actual zoom_level animates via tick_zoom().
+                // Centering is handled when tick_zoom() detects threshold crossing.
                 state.viewer.toggle_zoom();
-                if state.viewer.zoomed {
-                    return center_zoom_scroll(state);
-                }
             } else if let Some(idx) = state.selected_thumb {
                 // In grid: open selected image (current Space behavior)
                 if !state.dup_view_active
@@ -537,6 +545,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                     refresh_metadata(state);
                     return preload_viewer_images(state);
                 }
+            }
+        }
+        Message::CenterZoomScroll => {
+            return center_zoom_scroll(state);
+        }
+        Message::ZoomAdjust(delta) => {
+            if state.viewer.current_index.is_some() {
+                // Sets zoom_target; actual zoom_level animates via tick_zoom().
+                // Centering is handled when tick_zoom() detects threshold crossing.
+                state.viewer.adjust_zoom(delta);
             }
         }
         Message::ZoomScrolled(x, y) => {
@@ -555,7 +573,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewport_height = height;
         }
         Message::KeyEscape => {
-            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
                 state.viewer.reset_zoom();
             } else if state.viewer.current_index.is_some() {
                 state.viewer.close();
@@ -570,8 +588,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyLeft => {
-            if state.viewer.current_index.is_some() && state.viewer.zoomed {
-                return pan_zoom(state, -100.0, 0.0);
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+                return pan_zoom(state, -30.0, 0.0);
             } else if state.viewer.current_index.is_some() {
                 state.viewer.prev();
                 state.selected_thumb = state.viewer.current_index;
@@ -582,8 +600,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyRight => {
-            if state.viewer.current_index.is_some() && state.viewer.zoomed {
-                return pan_zoom(state, 100.0, 0.0);
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+                return pan_zoom(state, 30.0, 0.0);
             } else if state.viewer.current_index.is_some() {
                 state.viewer.next(state.image_paths.len());
                 state.selected_thumb = state.viewer.current_index;
@@ -594,8 +612,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyUp => {
-            if state.viewer.current_index.is_some() && state.viewer.zoomed {
-                return pan_zoom(state, 0.0, -100.0);
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+                return pan_zoom(state, 0.0, -30.0);
             } else if !state.dup_view_active
                 && state.dup_compare.is_none()
                 && state.viewer.current_index.is_none()
@@ -605,8 +623,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyDown => {
-            if state.viewer.current_index.is_some() && state.viewer.zoomed {
-                return pan_zoom(state, 0.0, 100.0);
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+                return pan_zoom(state, 0.0, 30.0);
             } else if !state.dup_view_active
                 && state.dup_compare.is_none()
                 && state.viewer.current_index.is_none()
@@ -869,6 +887,7 @@ fn refresh_metadata(state: &mut Looky) {
 
 fn view(state: &Looky) -> Element<'_, Message> {
     let content = view_inner(state);
+    let in_viewer = state.viewer.current_index.is_some();
     KeyListener::new(content, |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
@@ -883,6 +902,15 @@ fn view(state: &Looky) -> Element<'_, Message> {
             Key::Named(Named::Enter) => Some(Message::KeyEnter),
             Key::Named(Named::Escape) => Some(Message::KeyEscape),
             _ => None,
+        }
+    })
+    .on_scroll(move |delta| {
+        // In the viewer: scroll = zoom. In the grid: return None so the
+        // grid scrollable handles it normally.
+        if in_viewer {
+            Some(Message::ZoomAdjust(delta))
+        } else {
+            None
         }
     })
     .into()
@@ -904,7 +932,7 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 None
             };
 
-            let zoomed = state.viewer.zoomed;
+            let zoom_level = state.viewer.zoom_level;
             let image_dims = state.viewer_dimensions.get(&index).copied();
 
             return viewer_view(
@@ -916,8 +944,10 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 has_prev,
                 has_next,
                 meta,
-                zoomed,
+                zoom_level,
                 image_dims,
+                state.viewport_width,
+                state.viewport_height,
             );
         }
     }
@@ -1349,6 +1379,13 @@ fn viewer_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("viewer-zoom")
 }
 
+/// Compute the fit-to-screen base size for an image in the viewport.
+/// Returns (fit_w, fit_h) — the size the image would be at zoom 1.0.
+fn fit_size(img_w: u32, img_h: u32, vp_w: f32, vp_h: f32) -> (f32, f32) {
+    let scale = (vp_w / img_w as f32).min(vp_h / img_h as f32);
+    (img_w as f32 * scale, img_h as f32 * scale)
+}
+
 fn center_zoom_scroll(state: &Looky) -> Task<Message> {
     let Some(idx) = state.viewer.current_index else {
         return Task::none();
@@ -1357,11 +1394,12 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
         return Task::none();
     };
 
-    // Image is rendered at 2x natural size; viewport is the window minus toolbar (~50px)
-    let render_w = img_w as f32 * 2.0;
-    let render_h = img_h as f32 * 2.0;
-    let vp_w = state.viewport_width;
+    let info_w = if state.viewer.show_info { 281.0 } else { 0.0 };
+    let vp_w = state.viewport_width - info_w;
     let vp_h = state.viewport_height - 50.0;
+    let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
+    let render_w = fit_w * state.viewer.zoom_level;
+    let render_h = fit_h * state.viewer.zoom_level;
 
     let center_x = ((render_w - vp_w) / 2.0).max(0.0);
     let center_y = ((render_h - vp_h) / 2.0).max(0.0);
@@ -1401,33 +1439,45 @@ fn viewer_view<'a>(
     has_prev: bool,
     has_next: bool,
     meta: Option<&'a PhotoMetadata>,
-    zoomed: bool,
+    zoom_level: f32,
     image_dims: Option<(u32, u32)>,
+    viewport_width: f32,
+    viewport_height: f32,
 ) -> Element<'a, Message> {
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    let zoom_label = if zoom_level > 1.0 {
+        format!(" [{}%]", (zoom_level * 100.0) as u32)
+    } else {
+        String::new()
+    };
     let info_label = if meta.is_some() { "Info \u{2190}" } else { "Info \u{2192}" };
     let toolbar = row![
         button("Back").on_press(Message::BackToGrid),
         button(info_label).on_press(Message::ToggleInfo),
         Space::new().width(Length::Fill),
-        text(format!("{} ({}/{})", filename, index + 1, total)).size(14),
+        text(format!("{} ({}/{}){}", filename, index + 1, total, zoom_label)).size(14),
     ]
     .spacing(10)
     .padding(10);
 
-    if zoomed {
-        // Zoomed view: render at 2x natural size inside a bi-directional scrollable
+    if zoom_level > 1.0 {
+        // Zoomed view: render at zoom_level × fit-to-screen size
         let handle = full_handle.or(thumb_handle);
         let image_layer: Element<'a, Message> = if let Some(h) = handle {
-            let (w, h_dim) = image_dims.unwrap_or((800, 600));
+            let (img_w, img_h) = image_dims.unwrap_or((800, 600));
+            // Available area for the image (subtract toolbar, info panel)
+            let info_w = if meta.is_some() { 281.0 } else { 0.0 };
+            let avail_w = viewport_width - info_w;
+            let avail_h = viewport_height - 50.0;
+            let (fit_w, fit_h) = fit_size(img_w, img_h, avail_w, avail_h);
             let img = image(h.clone())
-                .content_fit(iced::ContentFit::None)
-                .width(w as f32 * 2.0)
-                .height(h_dim as f32 * 2.0);
+                .content_fit(iced::ContentFit::Fill)
+                .width(fit_w * zoom_level)
+                .height(fit_h * zoom_level);
             container(img).into()
         } else {
             container(Space::new()).center(Length::Fill).into()

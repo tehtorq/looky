@@ -2,13 +2,26 @@ use std::time::Instant;
 
 const CROSSFADE_DURATION_MS: f32 = 250.0;
 
-#[derive(Default)]
 pub struct ViewerState {
     pub current_index: Option<usize>,
     pub transition: Option<Transition>,
     pub show_info: bool,
-    pub zoomed: bool,
+    pub zoom_level: f32,
+    pub zoom_target: f32,
     pub zoom_offset: (f32, f32),
+}
+
+impl Default for ViewerState {
+    fn default() -> Self {
+        Self {
+            current_index: None,
+            transition: None,
+            show_info: false,
+            zoom_level: 1.0,
+            zoom_target: 1.0,
+            zoom_offset: (0.0, 0.0),
+        }
+    }
 }
 
 pub struct Transition {
@@ -32,14 +45,64 @@ impl ViewerState {
         self.show_info = !self.show_info;
     }
 
+    pub fn is_zoomed(&self) -> bool {
+        self.zoom_level > 1.0
+    }
+
+    pub fn is_zoom_animating(&self) -> bool {
+        (self.zoom_level - self.zoom_target).abs() > 0.005
+    }
+
     pub fn toggle_zoom(&mut self) {
-        self.zoomed = !self.zoomed;
+        if self.zoom_target > 1.0 {
+            self.zoom_target = 1.0;
+        } else {
+            self.zoom_target = 2.0;
+        }
         self.zoom_offset = (0.0, 0.0);
     }
 
     pub fn reset_zoom(&mut self) {
-        self.zoomed = false;
+        self.zoom_level = 1.0;
+        self.zoom_target = 1.0;
         self.zoom_offset = (0.0, 0.0);
+    }
+
+    /// Set zoom target from a scroll delta. The actual zoom_level is animated
+    /// toward this target on each tick.
+    pub fn adjust_zoom(&mut self, delta: f32) {
+        let factor = 2.0_f32.powf(delta * 0.15);
+        self.zoom_target = (self.zoom_target * factor).clamp(1.0, 8.0);
+        if self.zoom_target < 1.02 {
+            self.zoom_target = 1.0;
+        }
+    }
+
+    /// Animate zoom_level toward zoom_target. Returns true if zoom just
+    /// crossed from <=1.0 to >1.0 (scrollable needs centering).
+    pub fn tick_zoom(&mut self) -> bool {
+        if !self.is_zoom_animating() {
+            self.zoom_level = self.zoom_target;
+            if self.zoom_level < 1.02 && self.zoom_target <= 1.0 {
+                self.zoom_level = 1.0;
+                self.zoom_target = 1.0;
+                self.zoom_offset = (0.0, 0.0);
+            }
+            return false;
+        }
+        let was_zoomed = self.is_zoomed();
+        // Exponential easing — cover 25% of remaining distance per frame (~60fps)
+        self.zoom_level += (self.zoom_target - self.zoom_level) * 0.25;
+        // Snap when very close
+        if (self.zoom_level - self.zoom_target).abs() < 0.005 {
+            self.zoom_level = self.zoom_target;
+        }
+        if self.zoom_level < 1.02 && self.zoom_target <= 1.0 {
+            self.zoom_level = 1.0;
+            self.zoom_target = 1.0;
+            self.zoom_offset = (0.0, 0.0);
+        }
+        !was_zoomed && self.is_zoomed()
     }
 
     pub fn navigate_to(&mut self, new_index: usize) {

@@ -1,18 +1,23 @@
 //! A transparent wrapper widget that intercepts keyboard events synchronously.
 //! Unlike subscription-based keyboard handling, messages are produced in the
 //! same frame as the event — no async executor delay.
+//!
+//! Also supports Ctrl+scroll interception for zoom gestures (including
+//! trackpad pinch-to-zoom which maps to Ctrl+scroll on Linux).
 
 use iced::advanced::layout;
 use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
-use iced::keyboard;
-use iced::{Element, Event, Length, Rectangle, Size, Vector};
+use iced::{keyboard, mouse, Element, Event, Length, Rectangle, Size, Vector};
 
 pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_key_press: Box<dyn Fn(keyboard::Key, bool) -> Option<Message> + 'a>,
+    /// Called on scroll events. If it returns Some, the event is intercepted
+    /// (children like scrollable won't see it). If None, the event passes through.
+    on_scroll: Option<Box<dyn Fn(f32) -> Option<Message> + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
@@ -23,7 +28,16 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
         Self {
             content: content.into(),
             on_key_press: Box::new(on_key_press),
+            on_scroll: None,
         }
+    }
+
+    pub fn on_scroll(
+        mut self,
+        f: impl Fn(f32) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_scroll = Some(Box::new(f));
+        self
     }
 }
 
@@ -78,6 +92,28 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // Check scroll events BEFORE children so we can intercept them.
+        // If the callback returns Some, we consume the event (the scrollable
+        // won't see it). If None, we let it pass through to children.
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            if let Some(ref on_scroll) = self.on_scroll {
+                // Normalize to "line" units (~1.0 per mouse wheel click).
+                // Trackpad pixel events use /40 so a typical swipe
+                // (≈200-400px total over many events) maps to several "lines".
+                let y = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+                };
+                if y.abs() > 0.001 {
+                    if let Some(message) = on_scroll(y) {
+                        shell.publish(message);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Pass event to children
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
