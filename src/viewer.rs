@@ -7,6 +7,8 @@ pub struct ViewerState {
     pub current_index: Option<usize>,
     pub transition: Option<Transition>,
     pub show_info: bool,
+    pub zoomed: bool,
+    pub zoom_offset: (f32, f32),
 }
 
 pub struct Transition {
@@ -23,16 +25,28 @@ impl ViewerState {
     pub fn close(&mut self) {
         self.current_index = None;
         self.transition = None;
+        self.reset_zoom();
     }
 
     pub fn toggle_info(&mut self) {
         self.show_info = !self.show_info;
     }
 
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = !self.zoomed;
+        self.zoom_offset = (0.0, 0.0);
+    }
+
+    pub fn reset_zoom(&mut self) {
+        self.zoomed = false;
+        self.zoom_offset = (0.0, 0.0);
+    }
+
     pub fn navigate_to(&mut self, new_index: usize) {
         if let Some(old_index) = self.current_index {
             if old_index != new_index {
                 self.current_index = Some(new_index);
+                self.reset_zoom();
             }
         }
     }

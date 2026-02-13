@@ -78,6 +78,7 @@ struct Looky {
     viewport_height: f32,
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
+    viewer_dimensions: HashMap<usize, (u32, u32)>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
 }
 
@@ -110,6 +111,7 @@ impl Default for Looky {
             viewport_height: 600.0,
             selected_thumb: None,
             viewer_cache: HashMap::new(),
+            viewer_dimensions: HashMap::new(),
             viewer_preload_handles: Vec::new(),
         }
     }
@@ -140,6 +142,9 @@ pub enum Message {
     BackFromDuplicates,
     CompareDuplicates(usize),
     BackFromCompare,
+    // Zoom
+    ToggleZoom,
+    ZoomScrolled(f32, f32),
     // Navigation
     GridScrolled(f32),
     WindowResized(f32, f32),
@@ -333,6 +338,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewer.close();
             state.cached_metadata = None;
             state.viewer_cache.clear();
+            state.viewer_dimensions.clear();
             return restore_grid_scroll(state);
         }
         Message::ToggleInfo => {
@@ -342,12 +348,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             log::debug!("viewer: [{}] loaded ({}x{})", index, width, height);
             let handle = image::Handle::from_rgba(width, height, rgba);
             state.viewer_cache.insert(index, handle);
+            state.viewer_dimensions.insert(index, (width, height));
             // Evict distant entries to limit memory (keep ±3 of current)
             if let Some(current) = state.viewer.current_index {
                 let keep_min = current.saturating_sub(3);
                 let keep_max = current + 3;
                 state
                     .viewer_cache
+                    .retain(|&k, _| k >= keep_min && k <= keep_max);
+                state
+                    .viewer_dimensions
                     .retain(|&k, _| k >= keep_min && k <= keep_max);
                 // Current image just arrived — now preload neighbors
                 if index == current {
@@ -510,6 +520,28 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::BackFromCompare => {
             state.dup_compare = None;
         }
+        // Zoom
+        Message::ToggleZoom => {
+            if state.viewer.current_index.is_some() {
+                state.viewer.toggle_zoom();
+                if state.viewer.zoomed {
+                    return center_zoom_scroll(state);
+                }
+            } else if let Some(idx) = state.selected_thumb {
+                // In grid: open selected image (current Space behavior)
+                if !state.dup_view_active
+                    && state.dup_compare.is_none()
+                    && idx < state.thumbnails.len()
+                {
+                    state.viewer.open_index(idx);
+                    refresh_metadata(state);
+                    return preload_viewer_images(state);
+                }
+            }
+        }
+        Message::ZoomScrolled(x, y) => {
+            state.viewer.zoom_offset = (x, y);
+        }
         // Navigation
         Message::GridScrolled(y) => {
             state.grid_scroll_y = y;
@@ -523,7 +555,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewport_height = height;
         }
         Message::KeyEscape => {
-            if state.viewer.current_index.is_some() {
+            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+                state.viewer.reset_zoom();
+            } else if state.viewer.current_index.is_some() {
                 state.viewer.close();
                 state.cached_metadata = None;
                 return restore_grid_scroll(state);
@@ -536,7 +570,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyLeft => {
-            if state.viewer.current_index.is_some() {
+            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+                return pan_zoom(state, -100.0, 0.0);
+            } else if state.viewer.current_index.is_some() {
                 state.viewer.prev();
                 state.selected_thumb = state.viewer.current_index;
                 refresh_metadata(state);
@@ -546,7 +582,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyRight => {
-            if state.viewer.current_index.is_some() {
+            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+                return pan_zoom(state, 100.0, 0.0);
+            } else if state.viewer.current_index.is_some() {
                 state.viewer.next(state.image_paths.len());
                 state.selected_thumb = state.viewer.current_index;
                 refresh_metadata(state);
@@ -556,7 +594,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyUp => {
-            if !state.dup_view_active
+            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+                return pan_zoom(state, 0.0, -100.0);
+            } else if !state.dup_view_active
                 && state.dup_compare.is_none()
                 && state.viewer.current_index.is_none()
             {
@@ -565,7 +605,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             }
         }
         Message::KeyDown => {
-            if !state.dup_view_active
+            if state.viewer.current_index.is_some() && state.viewer.zoomed {
+                return pan_zoom(state, 0.0, 100.0);
+            } else if !state.dup_view_active
                 && state.dup_compare.is_none()
                 && state.viewer.current_index.is_none()
             {
@@ -828,19 +870,17 @@ fn refresh_metadata(state: &mut Looky) {
 fn view(state: &Looky) -> Element<'_, Message> {
     let content = view_inner(state);
     KeyListener::new(content, |key, repeat| {
-        if repeat {
-            return None;
-        }
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
         match key {
+            // Arrow keys allow repeats for smooth panning
             Key::Named(Named::ArrowLeft) => Some(Message::KeyLeft),
             Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
             Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
             Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
-            Key::Named(Named::Enter) | Key::Named(Named::Space) => {
-                Some(Message::KeyEnter)
-            }
+            _ if repeat => None,
+            Key::Named(Named::Space) => Some(Message::ToggleZoom),
+            Key::Named(Named::Enter) => Some(Message::KeyEnter),
             Key::Named(Named::Escape) => Some(Message::KeyEscape),
             _ => None,
         }
@@ -864,6 +904,9 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 None
             };
 
+            let zoomed = state.viewer.zoomed;
+            let image_dims = state.viewer_dimensions.get(&index).copied();
+
             return viewer_view(
                 path,
                 thumb_handle,
@@ -873,6 +916,8 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 has_prev,
                 has_next,
                 meta,
+                zoomed,
+                image_dims,
             );
         }
     }
@@ -1300,6 +1345,53 @@ fn duplicates_compare_view<'a>(state: &'a Looky, group: &'a DuplicateGroup) -> E
     container(column![toolbar, compare_row]).into()
 }
 
+fn viewer_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("viewer-zoom")
+}
+
+fn center_zoom_scroll(state: &Looky) -> Task<Message> {
+    let Some(idx) = state.viewer.current_index else {
+        return Task::none();
+    };
+    let Some(&(img_w, img_h)) = state.viewer_dimensions.get(&idx) else {
+        return Task::none();
+    };
+
+    // Image is rendered at 2x natural size; viewport is the window minus toolbar (~50px)
+    let render_w = img_w as f32 * 2.0;
+    let render_h = img_h as f32 * 2.0;
+    let vp_w = state.viewport_width;
+    let vp_h = state.viewport_height - 50.0;
+
+    let center_x = ((render_w - vp_w) / 2.0).max(0.0);
+    let center_y = ((render_h - vp_h) / 2.0).max(0.0);
+
+    use iced::widget::operation::AbsoluteOffset;
+    iced::widget::operation::scroll_to(
+        viewer_scroll_id(),
+        AbsoluteOffset {
+            x: Some(center_x),
+            y: Some(center_y),
+        },
+    )
+}
+
+fn pan_zoom(state: &mut Looky, dx: f32, dy: f32) -> Task<Message> {
+    let (ox, oy) = state.viewer.zoom_offset;
+    let new_x = (ox + dx).max(0.0);
+    let new_y = (oy + dy).max(0.0);
+    state.viewer.zoom_offset = (new_x, new_y);
+
+    use iced::widget::operation::AbsoluteOffset;
+    iced::widget::operation::scroll_to(
+        viewer_scroll_id(),
+        AbsoluteOffset {
+            x: Some(new_x),
+            y: Some(new_y),
+        },
+    )
+}
+
 fn viewer_view<'a>(
     path: &'a PathBuf,
     thumb_handle: Option<&'a image::Handle>,
@@ -1309,12 +1401,64 @@ fn viewer_view<'a>(
     has_prev: bool,
     has_next: bool,
     meta: Option<&'a PhotoMetadata>,
+    zoomed: bool,
+    image_dims: Option<(u32, u32)>,
 ) -> Element<'a, Message> {
-    // Layer thumbnail underneath full-res so there's never a blank frame.
-    // The thumbnail shows immediately; full-res paints on top when ready.
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let info_label = if meta.is_some() { "Info \u{2190}" } else { "Info \u{2192}" };
+    let toolbar = row![
+        button("Back").on_press(Message::BackToGrid),
+        button(info_label).on_press(Message::ToggleInfo),
+        Space::new().width(Length::Fill),
+        text(format!("{} ({}/{})", filename, index + 1, total)).size(14),
+    ]
+    .spacing(10)
+    .padding(10);
+
+    if zoomed {
+        // Zoomed view: render at 2x natural size inside a bi-directional scrollable
+        let handle = full_handle.or(thumb_handle);
+        let image_layer: Element<'a, Message> = if let Some(h) = handle {
+            let (w, h_dim) = image_dims.unwrap_or((800, 600));
+            let img = image(h.clone())
+                .content_fit(iced::ContentFit::None)
+                .width(w as f32 * 2.0)
+                .height(h_dim as f32 * 2.0);
+            container(img).into()
+        } else {
+            container(Space::new()).center(Length::Fill).into()
+        };
+
+        let zoom_scroll = scrollable(image_layer)
+            .id(viewer_scroll_id())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .on_scroll(|vp| {
+                let offset = vp.absolute_offset();
+                Message::ZoomScrolled(offset.x, offset.y)
+            });
+
+        let body: Element<'_, Message> = if let Some(m) = meta {
+            let panel = info_panel(m);
+            row![panel, zoom_scroll].into()
+        } else {
+            zoom_scroll.into()
+        };
+
+        return column![toolbar, body].into();
+    }
+
+    // Normal (fit-to-screen) view
     let image_layer: Element<'a, Message> = match (full_handle, thumb_handle) {
         (Some(full), Some(thumb)) => {
-            // Both available: stack thumb behind full-res for seamless swap
             let thumb_img = image(thumb.clone())
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
@@ -1351,21 +1495,6 @@ fn viewer_view<'a>(
                 .into()
         }
     };
-
-    let filename = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let info_label = if meta.is_some() { "Info \u{2190}" } else { "Info \u{2192}" };
-    let toolbar = row![
-        button("Back").on_press(Message::BackToGrid),
-        button(info_label).on_press(Message::ToggleInfo),
-        Space::new().width(Length::Fill),
-        text(format!("{} ({}/{})", filename, index + 1, total)).size(14),
-    ]
-    .spacing(10)
-    .padding(10);
 
     // Left nav zone
     let left_zone: Element<'_, Message> = if has_prev {
