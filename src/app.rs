@@ -78,6 +78,7 @@ struct Looky {
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
+    last_viewer_handle: Option<image::Handle>,
 }
 
 impl Default for Looky {
@@ -110,6 +111,7 @@ impl Default for Looky {
             selected_thumb: None,
             viewer_cache: HashMap::new(),
             viewer_preload_handles: Vec::new(),
+            last_viewer_handle: None,
         }
     }
 }
@@ -341,6 +343,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewer.close();
             state.cached_metadata = None;
             state.viewer_cache.clear();
+            state.last_viewer_handle = None;
             return restore_grid_scroll(state);
         }
         Message::ToggleInfo => {
@@ -349,7 +352,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ViewerImageLoaded(index, rgba, width, height) => {
             log::debug!("viewer: [{}] loaded ({}x{})", index, width, height);
             let handle = image::Handle::from_rgba(width, height, rgba);
-            state.viewer_cache.insert(index, handle);
+            state.viewer_cache.insert(index, handle.clone());
             // Evict distant entries to limit memory (keep ±3 of current)
             if let Some(current) = state.viewer.current_index {
                 let keep_min = current.saturating_sub(3);
@@ -357,8 +360,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state
                     .viewer_cache
                     .retain(|&k, _| k >= keep_min && k <= keep_max);
-                // Current image just arrived — now preload neighbors
+                // Update last displayed handle when current image arrives
                 if index == current {
+                    state.last_viewer_handle = Some(handle);
                     return preload_viewer_neighbors(state);
                 }
             }
@@ -837,7 +841,8 @@ fn view(state: &Looky) -> Element<'_, Message> {
             let has_next = index + 1 < state.image_paths.len();
 
             let current_handle = state.viewer_cache.get(&index)
-                .or_else(|| state.thumbnails.get(index).map(|(_, h, _)| h));
+                .or_else(|| state.thumbnails.get(index).map(|(_, h, _)| h))
+                .or(state.last_viewer_handle.as_ref());
 
             let fade_from = state.viewer.transition.as_ref().and_then(|t| {
                 let progress = state.viewer.transition_progress().unwrap_or(1.0);
