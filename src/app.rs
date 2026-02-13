@@ -1,7 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::widget::{button, column, container, image, row, rule, scrollable, text, Space};
@@ -79,7 +77,7 @@ struct Looky {
     viewport_height: f32,
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
-    viewer_generation: Arc<AtomicU64>,
+    viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
 }
 
 impl Default for Looky {
@@ -111,7 +109,7 @@ impl Default for Looky {
             viewport_height: 600.0,
             selected_thumb: None,
             viewer_cache: HashMap::new(),
-            viewer_generation: Arc::new(AtomicU64::new(0)),
+            viewer_preload_handles: Vec::new(),
         }
     }
 }
@@ -349,6 +347,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewer.toggle_info();
         }
         Message::ViewerImageLoaded(index, rgba, width, height) => {
+            log::debug!("viewer: [{}] loaded ({}x{})", index, width, height);
             let handle = image::Handle::from_rgba(width, height, rgba);
             state.viewer_cache.insert(index, handle);
             // Evict distant entries to limit memory (keep ±3 of current)
@@ -734,19 +733,25 @@ fn load_next_dup_batch(state: &mut Looky) -> Task<Message> {
     )
 }
 
-fn preload_viewer_images(state: &Looky) -> Task<Message> {
+fn preload_viewer_images(state: &mut Looky) -> Task<Message> {
+    // Abort all in-flight preloads — the user navigated, old work is stale
+    for (idx, handle) in state.viewer_preload_handles.drain(..) {
+        log::debug!("viewer: [{}] aborted", idx);
+        handle.abort();
+    }
+
     let Some(idx) = state.viewer.current_index else {
         return Task::none();
     };
-    // Bump generation — stale neighbor tasks will check this and bail out
-    state.viewer_generation.fetch_add(1, Ordering::Relaxed);
 
     // Prioritize the current image — load it first, neighbors come after
     if state.viewer_cache.contains_key(&idx) {
+        log::debug!("viewer: [{}] already cached, loading neighbors", idx);
         return preload_viewer_neighbors(state);
     }
+    log::debug!("viewer: [{}] loading (current)", idx);
     let path = state.image_paths[idx].clone();
-    Task::perform(
+    let (task, handle) = Task::perform(
         async move {
             match open_image_oriented(&path) {
                 Some(rgba) => {
@@ -758,15 +763,16 @@ fn preload_viewer_images(state: &Looky) -> Task<Message> {
         },
         |msg| msg,
     )
+    .abortable();
+    state.viewer_preload_handles.push((idx, handle));
+    task
 }
 
-fn preload_viewer_neighbors(state: &Looky) -> Task<Message> {
+fn preload_viewer_neighbors(state: &mut Looky) -> Task<Message> {
     let Some(idx) = state.viewer.current_index else {
         return Task::none();
     };
     let total = state.image_paths.len();
-    let generation = state.viewer_generation.clone();
-    let expected = generation.load(Ordering::Relaxed);
     let mut tasks = Vec::new();
     let start = idx.saturating_sub(3);
     let end = (idx + 3).min(total.saturating_sub(1));
@@ -774,13 +780,9 @@ fn preload_viewer_neighbors(state: &Looky) -> Task<Message> {
         if i != idx && !state.viewer_cache.contains_key(&i) {
             let path = state.image_paths[i].clone();
             let index = i;
-            let generation = generation.clone();
-            tasks.push(Task::perform(
+            log::debug!("viewer: [{}] loading (neighbor)", i);
+            let (task, handle) = Task::perform(
                 async move {
-                    // Skip decode if user has navigated away
-                    if generation.load(Ordering::Relaxed) != expected {
-                        return Message::Tick;
-                    }
                     match open_image_oriented(&path) {
                         Some(rgba) => {
                             let (w, h) = rgba.dimensions();
@@ -790,7 +792,10 @@ fn preload_viewer_neighbors(state: &Looky) -> Task<Message> {
                     }
                 },
                 |msg| msg,
-            ));
+            )
+            .abortable();
+            state.viewer_preload_handles.push((i, handle));
+            tasks.push(task);
         }
     }
     Task::batch(tasks)
