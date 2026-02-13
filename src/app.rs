@@ -517,7 +517,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::WindowResized(width, height) => {
             let available = width - GRID_PADDING * 2.0;
-            let cols = ((available + 8.0) / THUMB_CELL).max(1.0) as usize;
+            let cols = (available / THUMB_CELL).max(1.0) as usize;
             state.grid_columns = cols;
             state.viewport_width = width;
             state.viewport_height = height;
@@ -976,8 +976,8 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
 }
 
 const THUMB_SIZE: f32 = 200.0;
-const THUMB_CELL: f32 = THUMB_SIZE + 8.0 + 8.0; // image + button padding + spacing
-const GRID_PADDING: f32 = 10.0;
+const THUMB_CELL: f32 = THUMB_SIZE;
+const GRID_PADDING: f32 = 0.0;
 
 fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
     let thumbnails = &state.thumbnails;
@@ -988,7 +988,7 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
 
     iced::widget::responsive(move |size| {
         let available = size.width - GRID_PADDING * 2.0;
-        let thumbs_per_row = ((available + 8.0) / THUMB_CELL).max(1.0) as usize;
+        let thumbs_per_row = (available / THUMB_CELL).max(1.0) as usize;
         let total_rows = (thumbnails.len() + thumbs_per_row - 1) / thumbs_per_row;
 
         // Determine visible row range (with 1-row buffer above and below)
@@ -1049,19 +1049,26 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
                         };
 
                     let is_selected = selected == Some(index);
-                    let style = if is_selected {
-                        thumb_button_selected
+                    let thumb_content: Element<'_, Message> = if is_selected {
+                        iced::widget::stack![
+                            thumb_content,
+                            container(Space::new())
+                                .width(THUMB_SIZE)
+                                .height(THUMB_SIZE)
+                                .style(selection_overlay_style),
+                        ]
+                        .into()
                     } else {
-                        thumb_button_normal
+                        thumb_content
                     };
                     button(thumb_content)
                         .on_press(Message::ViewImage(index))
-                        .padding(4)
-                        .style(style)
+                        .padding(0)
+                        .style(thumb_button_normal)
                         .into()
                 })
                 .collect();
-            items.push(row(row_items).spacing(8).into());
+            items.push(row(row_items).spacing(0).into());
         }
 
         // Bottom spacer for rows below visible range
@@ -1075,7 +1082,7 @@ fn thumbnail_grid(state: &Looky) -> Element<'_, Message> {
             );
         }
 
-        column(items).spacing(8).padding(GRID_PADDING).into()
+        column(items).spacing(0).padding(GRID_PADDING).into()
     })
     .into()
 }
@@ -1088,16 +1095,14 @@ fn thumb_button_normal(_theme: &Theme, _status: button::Status) -> button::Style
     }
 }
 
-fn thumb_button_selected(theme: &Theme, _status: button::Status) -> button::Style {
-    let palette = theme.palette();
-    button::Style {
-        background: None,
+fn selection_overlay_style(_theme: &Theme) -> container::Style {
+    container::Style {
         border: iced::Border {
-            color: palette.primary,
+            color: Color::WHITE,
             width: 3.0,
-            radius: 4.0.into(),
+            ..Default::default()
         },
-        ..button::Style::default()
+        ..Default::default()
     }
 }
 
