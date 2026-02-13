@@ -32,10 +32,6 @@ impl ViewerState {
     pub fn navigate_to(&mut self, new_index: usize) {
         if let Some(old_index) = self.current_index {
             if old_index != new_index {
-                self.transition = Some(Transition {
-                    from_index: old_index,
-                    start: Instant::now(),
-                });
                 self.current_index = Some(new_index);
             }
         }

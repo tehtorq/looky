@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::widget::{button, column, container, image, row, rule, scrollable, text, Space};
@@ -12,6 +14,7 @@ use crate::thumbnail;
 use crate::viewer::ViewerState;
 
 const THUMBNAIL_BATCH_SIZE: usize = 32;
+const PREVIEW_BATCH_SIZE: usize = 16;
 const MAX_UPGRADE_BATCHES_IN_FLIGHT: usize = 3;
 const DUP_HASH_BATCH_SIZE: usize = 32;
 const VISUAL_DUP_THRESHOLD: u32 = 10;
@@ -72,9 +75,11 @@ struct Looky {
     dup_summaries: HashMap<usize, metadata::FileSummary>,
     grid_scroll_y: f32,
     grid_columns: usize,
+    viewport_width: f32,
     viewport_height: f32,
     selected_thumb: Option<usize>,
     viewer_cache: HashMap<usize, image::Handle>,
+    viewer_generation: Arc<AtomicU64>,
 }
 
 impl Default for Looky {
@@ -102,9 +107,11 @@ impl Default for Looky {
             dup_summaries: HashMap::new(),
             grid_scroll_y: 0.0,
             grid_columns: 4,
+            viewport_width: 800.0,
             viewport_height: 600.0,
             selected_thumb: None,
             viewer_cache: HashMap::new(),
+            viewer_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -351,6 +358,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state
                     .viewer_cache
                     .retain(|&k, _| k >= keep_min && k <= keep_max);
+                // Current image just arrived — now preload neighbors
+                if index == current {
+                    return preload_viewer_neighbors(state);
+                }
             }
         }
         Message::Tick => {
@@ -517,6 +528,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             let available = width - GRID_PADDING * 2.0;
             let cols = ((available + 8.0) / THUMB_CELL).max(1.0) as usize;
             state.grid_columns = cols;
+            state.viewport_width = width;
             state.viewport_height = height;
         }
         Message::KeyEscape => {
@@ -683,7 +695,7 @@ fn load_next_preview_batch(state: &mut Looky) -> Task<Message> {
         return Task::none();
     }
 
-    let count = THUMBNAIL_BATCH_SIZE.min(state.pending_thumbnails.len());
+    let count = PREVIEW_BATCH_SIZE.min(state.pending_thumbnails.len());
     let batch: Vec<PathBuf> = state.pending_thumbnails.drain(..count).collect();
 
     Task::perform(
@@ -726,16 +738,50 @@ fn preload_viewer_images(state: &Looky) -> Task<Message> {
     let Some(idx) = state.viewer.current_index else {
         return Task::none();
     };
+    // Bump generation — stale neighbor tasks will check this and bail out
+    state.viewer_generation.fetch_add(1, Ordering::Relaxed);
+
+    // Prioritize the current image — load it first, neighbors come after
+    if state.viewer_cache.contains_key(&idx) {
+        return preload_viewer_neighbors(state);
+    }
+    let path = state.image_paths[idx].clone();
+    Task::perform(
+        async move {
+            match open_image_oriented(&path) {
+                Some(rgba) => {
+                    let (w, h) = rgba.dimensions();
+                    Message::ViewerImageLoaded(idx, rgba.into_raw(), w, h)
+                }
+                None => Message::Tick,
+            }
+        },
+        |msg| msg,
+    )
+}
+
+fn preload_viewer_neighbors(state: &Looky) -> Task<Message> {
+    let Some(idx) = state.viewer.current_index else {
+        return Task::none();
+    };
     let total = state.image_paths.len();
+    let generation = state.viewer_generation.clone();
+    let expected = generation.load(Ordering::Relaxed);
     let mut tasks = Vec::new();
-    for i in [idx.saturating_sub(1), idx, (idx + 1).min(total.saturating_sub(1))] {
-        if i < total && !state.viewer_cache.contains_key(&i) {
+    let start = idx.saturating_sub(3);
+    let end = (idx + 3).min(total.saturating_sub(1));
+    for i in start..=end {
+        if i != idx && !state.viewer_cache.contains_key(&i) {
             let path = state.image_paths[i].clone();
             let index = i;
+            let generation = generation.clone();
             tasks.push(Task::perform(
                 async move {
-                    let img = open_image_oriented(&path);
-                    match img {
+                    // Skip decode if user has navigated away
+                    if generation.load(Ordering::Relaxed) != expected {
+                        return Message::Tick;
+                    }
+                    match open_image_oriented(&path) {
                         Some(rgba) => {
                             let (w, h) = rgba.dimensions();
                             Message::ViewerImageLoaded(index, rgba.into_raw(), w, h)
@@ -747,11 +793,23 @@ fn preload_viewer_images(state: &Looky) -> Task<Message> {
             ));
         }
     }
-    if tasks.is_empty() {
-        Task::none()
-    } else {
-        Task::batch(tasks)
-    }
+    Task::batch(tasks)
+}
+
+fn open_image_oriented(path: &std::path::Path) -> Option<::image::RgbaImage> {
+    let img = ::image::open(path).ok()?;
+    let orientation = thumbnail::read_orientation(path);
+    let oriented = match orientation {
+        2 => img.fliph(),
+        3 => img.rotate180(),
+        4 => img.flipv(),
+        5 => img.rotate90().fliph(),
+        6 => img.rotate90(),
+        7 => img.rotate270().fliph(),
+        8 => img.rotate270(),
+        _ => img,
+    };
+    Some(oriented.to_rgba8())
 }
 
 fn refresh_metadata(state: &mut Looky) {
@@ -1334,33 +1392,6 @@ fn viewer_view<'a>(
     };
 
     column![toolbar, body,].into()
-}
-
-fn open_image_oriented(path: &std::path::Path) -> Option<::image::RgbaImage> {
-    let img = ::image::open(path).ok()?;
-
-    let orientation = (|| -> Option<u32> {
-        let file = std::fs::File::open(path).ok()?;
-        let mut reader = std::io::BufReader::new(file);
-        let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
-        exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)?
-            .value
-            .get_uint(0)
-    })()
-    .unwrap_or(1);
-
-    let oriented = match orientation {
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.rotate90().fliph(),
-        6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
-        _ => img,
-    };
-
-    Some(oriented.to_rgba8())
 }
 
 fn viewer_image(

@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use image::imageops::FilterType;
@@ -44,11 +44,18 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
 
     // Try embedded EXIF thumbnail first (fast — avoids full decode).
     // Only use it if it's large enough to avoid blurry upscaling.
+    // Peek at JPEG header dimensions to skip full pixel decode for small thumbnails.
     if let Some(data) = exif_thumb {
-        if let Ok(img) = image::load_from_memory(&data) {
-            let (w, h) = img.dimensions();
-            if w.min(h) >= max_size {
-                let thumb = img.resize(max_size, max_size, FilterType::Lanczos3);
+        let large_enough = {
+            let mut d = jpeg_decoder::Decoder::new(Cursor::new(&data));
+            d.read_info()
+                .ok()
+                .and_then(|()| d.info())
+                .is_some_and(|i| (i.width as u32).min(i.height as u32) >= max_size)
+        };
+        if large_enough {
+            if let Ok(img) = image::load_from_memory(&data) {
+                let thumb = img.resize(max_size, max_size, FilterType::Triangle);
                 let thumb = apply_orientation(thumb, orientation);
                 let (w, h) = thumb.dimensions();
                 return (thumb.to_rgba8().into_raw(), w, h);
@@ -56,10 +63,18 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
         }
     }
 
+    // Try downscaled JPEG decode (avoids processing millions of unnecessary pixels)
+    if let Some(img) = decode_jpeg_scaled(path, max_size) {
+        let thumb = img.resize(max_size, max_size, FilterType::Triangle);
+        let thumb = apply_orientation(thumb, orientation);
+        let (w, h) = thumb.dimensions();
+        return (thumb.to_rgba8().into_raw(), w, h);
+    }
+
     // Fallback: full decode + resize
     match image::open(path) {
         Ok(img) => {
-            let thumb = img.resize(max_size, max_size, FilterType::Lanczos3);
+            let thumb = img.resize(max_size, max_size, FilterType::Triangle);
             let thumb = apply_orientation(thumb, orientation);
             let (w, h) = thumb.dimensions();
             (thumb.to_rgba8().into_raw(), w, h)
@@ -68,6 +83,46 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
             log::warn!("Failed to load image {}: {}", path.display(), e);
             placeholder_thumbnail(max_size)
         }
+    }
+}
+
+// --- Downscaled JPEG decode ---
+
+/// Decode a JPEG at reduced resolution using DCT scaling.
+/// For a 4000x3000 image targeting 400px, decodes at ~500x375 instead of 12M pixels.
+/// Returns None for non-JPEG files, small images, or on failure.
+fn decode_jpeg_scaled(path: &Path, max_size: u32) -> Option<DynamicImage> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if ext != "jpg" && ext != "jpeg" {
+        return None;
+    }
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut decoder = jpeg_decoder::Decoder::new(BufReader::new(file));
+
+    // scale() reads the header internally and picks the optimal DCT scale factor.
+    // It returns the actual output dimensions.
+    let max_u16 = max_size as u16;
+    let (actual_w, actual_h) = decoder.scale(max_u16, max_u16).ok()?;
+
+    // Only beneficial if the decoder actually downscaled
+    let info = decoder.info()?;
+    if actual_w == info.width && actual_h == info.height {
+        return None;
+    }
+
+    let pixels = decoder.decode().ok()?;
+
+    match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(actual_w as u32, actual_h as u32, pixels)
+                .map(DynamicImage::ImageRgb8)
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            image::GrayImage::from_raw(actual_w as u32, actual_h as u32, pixels)
+                .map(DynamicImage::ImageLuma8)
+        }
+        _ => None,
     }
 }
 
@@ -128,6 +183,11 @@ fn save_to_cache(key: &str, rgba: &[u8], width: u32, height: u32) {
 
 // --- EXIF ---
 
+/// Read just the EXIF orientation value.
+pub fn read_orientation(path: &Path) -> u32 {
+    read_exif_info(path).0
+}
+
 /// Single file open + EXIF parse: returns (orientation, optional embedded thumbnail JPEG bytes).
 fn read_exif_info(path: &Path) -> (u32, Option<Vec<u8>>) {
     let Ok(file) = std::fs::File::open(path) else {
@@ -177,6 +237,7 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
         _ => img, // 1 = normal, or unknown
     }
 }
+
 
 fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
     let pixels = vec![60u8; (size * size * 4) as usize];
