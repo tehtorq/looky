@@ -2322,6 +2322,7 @@ dependencies = [
  "log",
  "notify",
  "qoi",
+ "rand",
  "rayon",
  "rfd",
  "rusqlite",

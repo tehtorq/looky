@@ -81,6 +81,11 @@ struct Looky {
     viewer_dimensions: HashMap<usize, (u32, u32)>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
     fullscreen: bool,
+    // Screensaver mode
+    screensaver_active: bool,
+    screensaver_order: Vec<usize>,
+    screensaver_position: usize,
+    was_fullscreen: bool,
 }
 
 impl Default for Looky {
@@ -115,6 +120,10 @@ impl Default for Looky {
             viewer_dimensions: HashMap::new(),
             viewer_preload_handles: Vec::new(),
             fullscreen: false,
+            screensaver_active: false,
+            screensaver_order: Vec::new(),
+            screensaver_position: 0,
+            was_fullscreen: false,
         }
     }
 }
@@ -152,6 +161,9 @@ pub enum Message {
     ViewerDrag(f32, f32),
     ViewerClickZoom(f32, f32),
     ViewerClickUnzoom(f32, f32),
+    // Screensaver
+    ToggleScreensaver,
+    ScreensaverAdvance,
     // Navigation
     GridScrolled(f32),
     WindowResized(f32, f32),
@@ -177,14 +189,17 @@ fn subscription(state: &Looky) -> Subscription<Message> {
     let needs_tick = state.viewer.is_transitioning()
         || state.viewer.is_zoom_animating()
         || thumbnails_fading(state);
+
+    let mut subs = vec![events];
     if needs_tick {
-        Subscription::batch([
-            events,
-            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
-        ])
-    } else {
-        events
+        subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
     }
+    if state.screensaver_active {
+        subs.push(
+            iced::time::every(Duration::from_secs(10)).map(|_| Message::ScreensaverAdvance),
+        );
+    }
+    Subscription::batch(subs)
 }
 
 fn thumbnails_fading(state: &Looky) -> bool {
@@ -363,12 +378,18 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             if let Some(current) = state.viewer.current_index {
                 let keep_min = current.saturating_sub(3);
                 let keep_max = current + 3;
+                // During screensaver, also keep the next image (random order, not a neighbor)
+                let ss_next = if state.screensaver_active {
+                    state.screensaver_order.get(state.screensaver_position + 1).copied()
+                } else {
+                    None
+                };
                 state
                     .viewer_cache
-                    .retain(|&k, _| k >= keep_min && k <= keep_max);
+                    .retain(|&k, _| (k >= keep_min && k <= keep_max) || ss_next == Some(k));
                 state
                     .viewer_dimensions
-                    .retain(|&k, _| k >= keep_min && k <= keep_max);
+                    .retain(|&k, _| (k >= keep_min && k <= keep_max) || ss_next == Some(k));
                 // Current image just arrived — now preload neighbors
                 if index == current {
                     return preload_viewer_neighbors(state);
@@ -616,6 +637,68 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 }
             }
         }
+        // Screensaver
+        Message::ToggleScreensaver => {
+            // If zoomed, treat as pan-down instead
+            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+                return pan_zoom(state, 0.0, 30.0);
+            }
+            if state.screensaver_active {
+                // Stop screensaver
+                state.screensaver_active = false;
+                state.viewer.close();
+                state.cached_metadata = None;
+                if !state.was_fullscreen {
+                    state.fullscreen = false;
+                    return iced::window::latest()
+                        .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
+                }
+                return Task::none();
+            } else if !state.image_paths.is_empty() {
+                // Start screensaver
+                state.was_fullscreen = state.fullscreen;
+                state.screensaver_active = true;
+                // Build shuffled order
+                let mut order: Vec<usize> = (0..state.image_paths.len()).collect();
+                use rand::seq::SliceRandom;
+                order.shuffle(&mut rand::rng());
+                state.screensaver_order = order;
+                state.screensaver_position = 0;
+                // Open first image
+                let idx = state.screensaver_order[0];
+                state.viewer.open_index(idx);
+                refresh_metadata(state);
+                let preload = preload_viewer_images(state);
+                let preload_next = preload_next_screensaver_image(state);
+                // Go fullscreen
+                if !state.fullscreen {
+                    state.fullscreen = true;
+                    let fs = iced::window::latest()
+                        .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Fullscreen));
+                    return Task::batch([preload, preload_next, fs]);
+                }
+                return Task::batch([preload, preload_next]);
+            }
+        }
+        Message::ScreensaverAdvance => {
+            if !state.screensaver_active {
+                return Task::none();
+            }
+            state.screensaver_position += 1;
+            if state.screensaver_position >= state.screensaver_order.len() {
+                // Reshuffle and restart
+                use rand::seq::SliceRandom;
+                state.screensaver_order.shuffle(&mut rand::rng());
+                state.screensaver_position = 0;
+            }
+            let idx = state.screensaver_order[state.screensaver_position];
+            state.viewer.open_index(idx);
+            state.viewer.reset_zoom();
+            refresh_metadata(state);
+            let preload = preload_viewer_images(state);
+            let preload_next = preload_next_screensaver_image(state);
+            return Task::batch([preload, preload_next]);
+        }
         // Navigation
         Message::GridScrolled(y) => {
             state.grid_scroll_y = y;
@@ -629,7 +712,17 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewport_height = height;
         }
         Message::KeyEscape => {
-            if state.fullscreen {
+            if state.screensaver_active {
+                state.screensaver_active = false;
+                state.viewer.close();
+                state.cached_metadata = None;
+                if !state.was_fullscreen {
+                    state.fullscreen = false;
+                    return iced::window::latest()
+                        .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
+                }
+                return Task::none();
+            } else if state.fullscreen {
                 state.fullscreen = false;
                 return iced::window::latest()
                     .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
@@ -927,6 +1020,37 @@ fn preload_viewer_neighbors(state: &mut Looky) -> Task<Message> {
     Task::batch(tasks)
 }
 
+fn preload_next_screensaver_image(state: &mut Looky) -> Task<Message> {
+    if !state.screensaver_active {
+        return Task::none();
+    }
+    let next_pos = state.screensaver_position + 1;
+    // If we're at the end, we'll reshuffle on advance — can't predict the order
+    if next_pos >= state.screensaver_order.len() {
+        return Task::none();
+    }
+    let next_idx = state.screensaver_order[next_pos];
+    if state.viewer_cache.contains_key(&next_idx) {
+        return Task::none();
+    }
+    let path = state.image_paths[next_idx].clone();
+    let (task, handle) = Task::perform(
+        async move {
+            match open_image_oriented(&path) {
+                Some(rgba) => {
+                    let (w, h) = rgba.dimensions();
+                    Message::ViewerImageLoaded(next_idx, rgba.into_raw(), w, h)
+                }
+                None => Message::Tick,
+            }
+        },
+        |msg| msg,
+    )
+    .abortable();
+    state.viewer_preload_handles.push((next_idx, handle));
+    task
+}
+
 fn open_image_oriented(path: &std::path::Path) -> Option<::image::RgbaImage> {
     let img = ::image::open(path).ok()?;
     let orientation = thumbnail::read_orientation(path);
@@ -958,21 +1082,38 @@ fn refresh_metadata(state: &mut Looky) {
 fn view(state: &Looky) -> Element<'_, Message> {
     let content = view_inner(state);
     let in_viewer = state.viewer.current_index.is_some();
-    KeyListener::new(content, |key, repeat| {
+    let screensaver = state.screensaver_active;
+    KeyListener::new(content, move |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
+        // During screensaver, only allow 's' (toggle off) and Escape
+        if screensaver {
+            return match &key {
+                Key::Character(c) if c.as_str() == "s" && !repeat => {
+                    Some(Message::ToggleScreensaver)
+                }
+                Key::Named(Named::Escape) if !repeat => Some(Message::KeyEscape),
+                _ => None,
+            };
+        }
         match &key {
             // Arrow/WASD keys allow repeats for smooth panning
             Key::Named(Named::ArrowLeft) => Some(Message::KeyLeft),
             Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
             Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
             Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
-            Key::Character(c) if matches!(c.as_str(), "a" | "w" | "s" | "d") => {
+            Key::Character(c) if c.as_str() == "s" => {
+                if repeat {
+                    Some(Message::KeyDown)
+                } else {
+                    Some(Message::ToggleScreensaver)
+                }
+            }
+            Key::Character(c) if matches!(c.as_str(), "a" | "w" | "d") => {
                 match c.as_str() {
                     "a" => Some(Message::KeyLeft),
                     "d" => Some(Message::KeyRight),
                     "w" => Some(Message::KeyUp),
-                    "s" => Some(Message::KeyDown),
                     _ => None,
                 }
             }
@@ -992,6 +1133,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
         }
     })
     .on_scroll(move |delta, cx, cy| {
+        if screensaver { return None; }
         if in_viewer {
             Some(Message::ZoomAdjust(delta, cx, cy))
         } else {
@@ -999,6 +1141,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
         }
     })
     .on_drag(move |dx, dy| {
+        if screensaver { return None; }
         if in_viewer {
             Some(Message::ViewerDrag(dx, dy))
         } else {
@@ -1006,6 +1149,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
         }
     })
     .on_click(move |cx, cy| {
+        if screensaver { return None; }
         if in_viewer {
             Some(Message::ViewerClickZoom(cx, cy))
         } else {
@@ -1013,6 +1157,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
         }
     })
     .on_right_click(move |cx, cy| {
+        if screensaver { return None; }
         if in_viewer {
             Some(Message::ViewerClickUnzoom(cx, cy))
         } else {
@@ -1053,6 +1198,7 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 image_dims,
                 state.viewport_width,
                 state.viewport_height,
+                state.screensaver_active,
             );
         }
     }
@@ -1669,7 +1815,30 @@ fn viewer_view<'a>(
     image_dims: Option<(u32, u32)>,
     viewport_width: f32,
     viewport_height: f32,
+    screensaver: bool,
 ) -> Element<'a, Message> {
+    // Screensaver mode: just the image on a black background, no UI chrome, hidden cursor
+    if screensaver {
+        // Prefer full-res only to avoid low→high-res flicker
+        let handle = full_handle.or(thumb_handle);
+        let image_layer: Element<'a, Message> = if let Some(h) = handle {
+            let img = image(h.clone())
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill);
+            container(img).center(Length::Fill).into()
+        } else {
+            container(Space::new()).center(Length::Fill).into()
+        };
+        let view = container(image_layer)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(screensaver_bg_style);
+        return iced::widget::MouseArea::new(view)
+            .interaction(iced::mouse::Interaction::Hidden)
+            .into();
+    }
+
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -2004,6 +2173,13 @@ fn info_panel(meta: &PhotoMetadata) -> Element<'_, Message> {
     )
     .padding(12)
     .into()
+}
+
+fn screensaver_bg_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(Color::BLACK)),
+        ..Default::default()
+    }
 }
 
 fn info_panel_style(_theme: &Theme) -> container::Style {
