@@ -378,11 +378,8 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             let crossed_threshold = state.viewer.tick_zoom();
             let new_zoom = state.viewer.zoom_level;
             if crossed_threshold {
-                // Scrollable just appeared — defer scroll positioning by one frame
                 return Task::done(Message::CenterZoomScroll);
             } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
-                // Zoom level changed during animation — adjust scroll to keep
-                // the anchor point (or center) fixed.
                 return anchor_zoom_scroll(state, old_zoom, new_zoom);
             }
         }
@@ -570,14 +567,11 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
                 let old_zoom = state.viewer.zoom_level;
                 state.viewer.adjust_zoom(delta);
-                // Step zoom_level directly toward target instead of waiting for
-                // a Tick message — Tick can be blocked by slow render passes on
-                // large images, causing zoom to appear frozen.
-                let crossed = state.viewer.tick_zoom();
+                // Snap zoom_level to target immediately — no residual
+                // animation after scrolling stops.
+                state.viewer.zoom_level = state.viewer.zoom_target;
                 let new_zoom = state.viewer.zoom_level;
-                if crossed {
-                    return Task::done(Message::CenterZoomScroll);
-                } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
                     return anchor_zoom_scroll(state, old_zoom, new_zoom);
                 }
             }
@@ -587,7 +581,6 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::ViewerDrag(dx, dy) => {
             if state.viewer.is_zoomed() {
-                // Drag in opposite direction: pull image right → scroll left
                 return pan_zoom(state, -dx, -dy);
             }
         }
@@ -597,11 +590,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                     state.viewer.zoom_anchor = Some((cx, cy));
                     let old_zoom = state.viewer.zoom_level;
                     state.viewer.adjust_zoom(4.0);
-                    let crossed = state.viewer.tick_zoom();
+                    let _crossed = state.viewer.tick_zoom();
                     let new_zoom = state.viewer.zoom_level;
-                    if crossed {
-                        return Task::done(Message::CenterZoomScroll);
-                    } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                    if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
                         return anchor_zoom_scroll(state, old_zoom, new_zoom);
                     }
                 }

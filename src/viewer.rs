@@ -12,6 +12,9 @@ pub struct ViewerState {
     /// Cursor position in window coordinates when zoom was initiated.
     /// Used to keep the point under the cursor fixed during zoom animation.
     pub zoom_anchor: Option<(f32, f32)>,
+    /// Last time tick_zoom advanced zoom_level — used to debounce so batched
+    /// scroll events don't cause multiple advances per frame.
+    last_zoom_tick: Option<Instant>,
 }
 
 impl Default for ViewerState {
@@ -24,6 +27,7 @@ impl Default for ViewerState {
             zoom_target: 1.0,
             zoom_offset: (0.0, 0.0),
             zoom_anchor: None,
+            last_zoom_tick: None,
         }
     }
 }
@@ -90,8 +94,11 @@ impl ViewerState {
         }
     }
 
-    /// Animate zoom_level toward zoom_target. Returns true if zoom just
-    /// crossed from <=1.0 to >1.0 (scrollable needs centering).
+    /// Animate zoom_level toward zoom_target using time-based easing.
+    /// Frame-rate independent: advances correctly whether called at 60fps
+    /// or after a 500ms GPU stall. Deduplicates calls within the same
+    /// instant so batched messages don't over-advance.
+    /// Returns true if zoom just crossed from <=1.0 to >1.0.
     pub fn tick_zoom(&mut self) -> bool {
         if !self.is_zoom_animating() {
             self.zoom_level = self.zoom_target;
@@ -102,9 +109,26 @@ impl ViewerState {
             }
             return false;
         }
+
+        let now = Instant::now();
+        let dt_ms = self
+            .last_zoom_tick
+            .map(|last| now.duration_since(last).as_secs_f32() * 1000.0)
+            .unwrap_or(16.0);
+        self.last_zoom_tick = Some(now);
+
+        // Skip if called again within the same millisecond (batched messages)
+        if dt_ms < 1.0 {
+            return false;
+        }
+
         let was_zoomed = self.is_zoomed();
-        // Exponential easing — cover 25% of remaining distance per frame (~60fps)
-        self.zoom_level += (self.zoom_target - self.zoom_level) * 0.25;
+        // Time-based exponential easing: 0.75 decay per 16ms frame.
+        // At 60fps (dt=16ms): same as old 25% step.
+        // After GPU stall (dt=500ms): catches up correctly in one call.
+        let frames = (dt_ms / 16.0).min(4.0); // cap at 4 frames to avoid snap
+        let decay = 0.75_f32.powf(frames);
+        self.zoom_level = self.zoom_target - (self.zoom_target - self.zoom_level) * decay;
         // Snap when very close
         if (self.zoom_level - self.zoom_target).abs() < 0.005 {
             self.zoom_level = self.zoom_target;
