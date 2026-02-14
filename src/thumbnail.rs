@@ -248,9 +248,11 @@ fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
 pub fn thumbnail_jpeg_bytes(path: &Path, max_size: u32, quality: u8) -> Vec<u8> {
     use image::ImageEncoder;
     let (rgba, w, h) = generate_thumbnail(path, max_size);
+    // JPEG doesn't support alpha — convert RGBA to RGB
+    let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|px| &px[..3]).copied().collect();
     let mut buf = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-    let _ = encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8);
+    let _ = encoder.write_image(&rgb, w, h, image::ExtendedColorType::Rgb8);
     buf
 }
 
