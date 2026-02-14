@@ -10,6 +10,8 @@ use crate::thumbnail;
 const THUMBS_PER_PAGE: usize = 60;
 const THUMB_MAX_SIZE: u32 = 400;
 const THUMB_QUALITY: u8 = 80;
+const DLNA_TRANSFER_MODE: &str = "transferMode.dlna.org: Streaming";
+const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
 
 type HttpResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -59,6 +61,14 @@ fn route(
         ("GET", path) if path.starts_with("/image/") => {
             let index: usize = path[7..].parse().unwrap_or(usize::MAX);
             serve_image(request, state, index)
+        }
+        ("HEAD", path) if path.starts_with("/thumb/") => {
+            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            serve_image_head(request, state, index, true)
+        }
+        ("HEAD", path) if path.starts_with("/image/") => {
+            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            serve_image_head(request, state, index, false)
         }
         ("GET", "/dlna/device.xml") => serve_device_xml(request, state),
         ("GET", "/dlna/content.xml") => serve_static_xml(request, dlna::content_directory_scpd()),
@@ -197,7 +207,9 @@ fn serve_thumbnail(
                     "Cache-Control: public, max-age=3600"
                         .parse::<tiny_http::Header>()
                         .unwrap(),
-                );
+                )
+                .with_header(DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap())
+                .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
             request.respond(response)?;
             return Ok(());
         }
@@ -223,7 +235,9 @@ fn serve_thumbnail(
             "Cache-Control: public, max-age=3600"
                 .parse::<tiny_http::Header>()
                 .unwrap(),
-        );
+        )
+        .with_header(DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap())
+        .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
     request.respond(response)?;
     Ok(())
 }
@@ -248,9 +262,48 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
             "Cache-Control: public, max-age=3600"
                 .parse::<tiny_http::Header>()
                 .unwrap(),
+            DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap(),
+            DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
         ],
         reader,
         Some(len as usize),
+        None,
+    );
+    request.respond(response)?;
+    Ok(())
+}
+
+fn serve_image_head(
+    request: tiny_http::Request,
+    state: &ServerState,
+    index: usize,
+    is_thumb: bool,
+) -> HttpResult {
+    if index >= state.image_paths.len() {
+        return serve_404(request);
+    }
+
+    let path = &state.image_paths[index];
+    let mime = if is_thumb { "image/jpeg" } else { dlna::mime_for_path(path) };
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let response = tiny_http::Response::new(
+        tiny_http::StatusCode(200),
+        vec![
+            format!("Content-Type: {mime}")
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+            format!("Content-Length: {len}")
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+            "Cache-Control: public, max-age=3600"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+            DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap(),
+            DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
+        ],
+        std::io::empty(),
+        Some(0),
         None,
     );
     request.respond(response)?;

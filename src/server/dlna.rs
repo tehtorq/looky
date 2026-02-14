@@ -187,6 +187,9 @@ fn extract_soap_action(body: &str) -> Option<String> {
     None
 }
 
+/// Max items per browse page when client sends RequestedCount=0 (meaning "all").
+const BROWSE_PAGE_SIZE: usize = 30;
+
 fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf]) -> String {
     let object_id = extract_xml_value(body, "ObjectID").unwrap_or_else(|| "0".to_string());
     let browse_flag = extract_xml_value(body, "BrowseFlag").unwrap_or_else(|| "BrowseDirectChildren".to_string());
@@ -199,20 +202,47 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
 
     let total = image_paths.len();
 
-    if browse_flag == "BrowseMetadata" && object_id == "0" {
-        // Root container metadata
-        let didl = format!(
-            r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><container id="0" parentID="-1" restricted="1" childCount="{total}"><dc:title>Photos</dc:title><upnp:class>object.container.storageFolder</upnp:class></container></DIDL-Lite>"#
-        );
-        let escaped = xml_escape(&didl);
+    log::debug!(
+        "DLNA Browse: flag={browse_flag} object_id={object_id} start={starting_index} count={requested_count} total={total}"
+    );
+
+    if browse_flag == "BrowseMetadata" {
+        if object_id == "0" {
+            // Root container metadata
+            let didl = format!(
+                r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><container id="0" parentID="-1" restricted="1" childCount="{total}"><dc:title>Photos</dc:title><upnp:class>object.container.storageFolder</upnp:class></container></DIDL-Lite>"#
+            );
+            let escaped = xml_escape(&didl);
+            return soap_response(
+                "Browse",
+                &format!("<Result>{escaped}</Result><NumberReturned>1</NumberReturned><TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"),
+            );
+        }
+
+        // Individual item metadata
+        if let Ok(idx) = object_id.parse::<usize>() {
+            if let Some(path) = image_paths.get(idx) {
+                let item = build_didl_item(idx, path, addr);
+                let didl = format!(
+                    r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">{item}</DIDL-Lite>"#
+                );
+                let escaped = xml_escape(&didl);
+                return soap_response(
+                    "Browse",
+                    &format!("<Result>{escaped}</Result><NumberReturned>1</NumberReturned><TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"),
+                );
+            }
+        }
+
+        // Unknown object ID — return empty
         return soap_response(
             "Browse",
-            &format!("<Result>{escaped}</Result><NumberReturned>1</NumberReturned><TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"),
+            "<Result>&lt;DIDL-Lite xmlns=&quot;urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/&quot;/&gt;</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>1</UpdateID>",
         );
     }
 
     // BrowseDirectChildren of root
-    let count = if requested_count == 0 { total } else { requested_count };
+    let count = if requested_count == 0 || requested_count > BROWSE_PAGE_SIZE { BROWSE_PAGE_SIZE } else { requested_count };
     let end = (starting_index + count).min(total);
     let slice = starting_index..end;
     let number_returned = slice.len();
@@ -220,13 +250,7 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
     let mut didl_items = String::new();
     for i in slice {
         if let Some(path) = image_paths.get(i) {
-            let title = xml_escape(&file_title(path));
-            let mime = mime_for_path(path);
-            let image_url = format!("http://{addr}/image/{i}");
-            let thumb_url = format!("http://{addr}/thumb/{i}");
-            didl_items.push_str(&format!(
-                r#"<item id="{i}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:{mime}:*">{image_url}</res><upnp:albumArtURI>{thumb_url}</upnp:albumArtURI></item>"#
-            ));
+            didl_items.push_str(&build_didl_item(i, path, addr));
         }
     }
 
@@ -237,6 +261,20 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
     soap_response(
         "Browse",
         &format!("<Result>{escaped}</Result><NumberReturned>{number_returned}</NumberReturned><TotalMatches>{total}</TotalMatches><UpdateID>1</UpdateID>"),
+    )
+}
+
+fn build_didl_item(index: usize, path: &Path, addr: SocketAddr) -> String {
+    let title = xml_escape(&file_title(path));
+    let mime = mime_for_path(path);
+    let image_url = format!("http://{addr}/image/{index}");
+    let thumb_url = format!("http://{addr}/thumb/{index}");
+    let size_attr = std::fs::metadata(path)
+        .map(|m| format!(r#" size="{}""#, m.len()))
+        .unwrap_or_default();
+    let dlna_features = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+    format!(
+        r#"<item id="{index}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:{mime}:{dlna_features}"{size_attr}>{image_url}</res><upnp:albumArtURI>{thumb_url}</upnp:albumArtURI></item>"#
     )
 }
 
