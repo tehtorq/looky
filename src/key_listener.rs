@@ -149,7 +149,9 @@ where
     ) {
         let state = tree.state.downcast_mut::<State>();
 
-        // --- Left mouse: click vs drag ---
+        // --- Pre-children: track press state and handle drag ---
+        // Press tracking and drag must happen before children so we can
+        // intercept the scrollable's own drag/scroll behavior.
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(pos) = cursor.position() {
@@ -187,35 +189,7 @@ where
                     }
                 }
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.pressed && !state.dragging {
-                    // Click (not a drag) — fire on_click
-                    if let Some(ref on_click) = self.on_click {
-                        if let Some(pos) = cursor.position() {
-                            if let Some(message) = on_click(pos.x, pos.y) {
-                                shell.publish(message);
-                            }
-                        }
-                    }
-                }
-                state.pressed = false;
-                state.press_pos = None;
-                state.dragging = false;
-                state.last_pos = None;
-            }
             _ => {}
-        }
-
-        // --- Right click ---
-        if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) = event {
-            if let Some(ref on_right_click) = self.on_right_click {
-                if let Some(pos) = cursor.position() {
-                    if let Some(message) = on_right_click(pos.x, pos.y) {
-                        shell.publish(message);
-                        return;
-                    }
-                }
-            }
         }
 
         // --- Scroll interception (before children) ---
@@ -238,7 +212,7 @@ where
             }
         }
 
-        // Pass event to children
+        // --- Pass event to children ---
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -251,13 +225,50 @@ where
         );
 
         if shell.is_event_captured() {
+            // A child widget (button, etc.) handled this event — clean up
+            // press state but don't fire click callbacks.
+            if matches!(event, Event::Mouse(mouse::Event::ButtonReleased(..))) {
+                state.pressed = false;
+                state.press_pos = None;
+                state.dragging = false;
+                state.last_pos = None;
+            }
             return;
         }
 
-        if let Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. }) = event {
-            if let Some(message) = (self.on_key_press)(key.clone(), *repeat) {
-                shell.publish(message);
+        // --- Post-children: clicks and keyboard ---
+        // Only fire click/right-click if no child widget captured the event.
+        match event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.pressed && !state.dragging {
+                    if let Some(ref on_click) = self.on_click {
+                        if let Some(pos) = cursor.position() {
+                            if let Some(message) = on_click(pos.x, pos.y) {
+                                shell.publish(message);
+                            }
+                        }
+                    }
+                }
+                state.pressed = false;
+                state.press_pos = None;
+                state.dragging = false;
+                state.last_pos = None;
             }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => {
+                if let Some(ref on_right_click) = self.on_right_click {
+                    if let Some(pos) = cursor.position() {
+                        if let Some(message) = on_right_click(pos.x, pos.y) {
+                            shell.publish(message);
+                        }
+                    }
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. }) => {
+                if let Some(message) = (self.on_key_press)(key.clone(), *repeat) {
+                    shell.publish(message);
+                }
+            }
+            _ => {}
         }
     }
 
