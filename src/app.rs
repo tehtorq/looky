@@ -80,6 +80,7 @@ struct Looky {
     viewer_cache: HashMap<usize, image::Handle>,
     viewer_dimensions: HashMap<usize, (u32, u32)>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
+    fullscreen: bool,
 }
 
 impl Default for Looky {
@@ -113,6 +114,7 @@ impl Default for Looky {
             viewer_cache: HashMap::new(),
             viewer_dimensions: HashMap::new(),
             viewer_preload_handles: Vec::new(),
+            fullscreen: false,
         }
     }
 }
@@ -159,6 +161,7 @@ pub enum Message {
     KeyUp,
     KeyDown,
     KeyEnter,
+    ToggleFullscreen,
 }
 
 fn subscription(state: &Looky) -> Subscription<Message> {
@@ -626,7 +629,11 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewport_height = height;
         }
         Message::KeyEscape => {
-            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
+            if state.fullscreen {
+                state.fullscreen = false;
+                return iced::window::latest()
+                    .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed));
+            } else if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
                 state.viewer.reset_zoom();
             } else if state.viewer.current_index.is_some() {
                 state.viewer.close();
@@ -699,6 +706,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                     return preload_viewer_images(state);
                 }
             }
+        }
+        Message::ToggleFullscreen => {
+            state.fullscreen = !state.fullscreen;
+            let mode = if state.fullscreen {
+                iced::window::Mode::Fullscreen
+            } else {
+                iced::window::Mode::Windowed
+            };
+            return iced::window::latest()
+                .and_then(move |id| iced::window::set_mode(id, mode));
         }
     }
     Task::none()
@@ -967,6 +984,10 @@ fn view(state: &Looky) -> Element<'_, Message> {
                 if repeat { return None; }
                 Some(Message::ToggleInfo)
             }
+            Key::Character(c) if c.as_str() == "f" => {
+                if repeat { return None; }
+                Some(Message::ToggleFullscreen)
+            }
             _ => None,
         }
     })
@@ -1027,6 +1048,7 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 has_next,
                 meta,
                 show_info,
+                state.fullscreen,
                 zoom_level,
                 image_dims,
                 state.viewport_width,
@@ -1642,6 +1664,7 @@ fn viewer_view<'a>(
     has_next: bool,
     meta: Option<&'a PhotoMetadata>,
     show_info: bool,
+    fullscreen: bool,
     zoom_level: f32,
     image_dims: Option<(u32, u32)>,
     viewport_width: f32,
@@ -1658,9 +1681,11 @@ fn viewer_view<'a>(
         String::new()
     };
     let info_label = if show_info { "Info \u{2190}" } else { "Info \u{2192}" };
+    let fs_label = if fullscreen { "Window" } else { "Fullscreen" };
     let toolbar = row![
         button("Back").on_press(Message::BackToGrid),
         button(info_label).on_press(Message::ToggleInfo),
+        button(fs_label).on_press(Message::ToggleFullscreen),
         Space::new().width(Length::Fill),
         text(format!("{} ({}/{}){}", filename, index + 1, total, zoom_label)).size(14),
     ]
@@ -1702,19 +1727,15 @@ fn viewer_view<'a>(
                 Message::ZoomScrolled(offset.x, offset.y)
             });
 
-        let body: Element<'_, Message> = if show_info {
+        let mut layers: Vec<Element<'_, Message>> = vec![zoom_scroll.into()];
+        if show_info {
             if let Some(m) = meta {
-                let panel = info_panel(m);
-                iced::widget::stack![zoom_scroll, panel]
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            } else {
-                zoom_scroll.into()
+                layers.push(info_panel(m));
             }
-        } else {
-            zoom_scroll.into()
-        };
+        }
+        let body = iced::widget::Stack::with_children(layers)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         return column![toolbar, body].into();
     }
@@ -1812,19 +1833,15 @@ fn viewer_view<'a>(
         .width(Length::Fill)
         .height(Length::Fill);
 
-    let body: Element<'_, Message> = if show_info {
+    let mut layers: Vec<Element<'_, Message>> = vec![image_with_nav.into()];
+    if show_info {
         if let Some(m) = meta {
-            let panel = info_panel(m);
-            iced::widget::stack![image_with_nav, panel]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            image_with_nav.into()
+            layers.push(info_panel(m));
         }
-    } else {
-        image_with_nav.into()
-    };
+    }
+    let body = iced::widget::Stack::with_children(layers)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
     column![toolbar, body].into()
 }
