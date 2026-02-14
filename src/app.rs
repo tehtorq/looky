@@ -972,6 +972,10 @@ fn view(state: &Looky) -> Element<'_, Message> {
             Key::Named(Named::Space) => Some(Message::ToggleZoom),
             Key::Named(Named::Enter) => Some(Message::KeyEnter),
             Key::Named(Named::Escape) => Some(Message::KeyEscape),
+            Key::Character(c) if c.as_str() == "i" => {
+                if repeat { return None; }
+                Some(Message::ToggleInfo)
+            }
             _ => None,
         }
     })
@@ -1016,11 +1020,8 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
             let full_handle = state.viewer_cache.get(&index);
             let thumb_handle = state.thumbnails.get(index).map(|(_, h, _)| h);
 
-            let meta = if state.viewer.show_info {
-                state.cached_metadata.as_ref().map(|(_, m)| m)
-            } else {
-                None
-            };
+            let meta = state.cached_metadata.as_ref().map(|(_, m)| m);
+            let show_info = state.viewer.show_info;
 
             let zoom_level = state.viewer.zoom_level;
             let image_dims = state.viewer_dimensions.get(&index).copied();
@@ -1034,6 +1035,7 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 has_prev,
                 has_next,
                 meta,
+                show_info,
                 zoom_level,
                 image_dims,
                 state.viewport_width,
@@ -1491,8 +1493,7 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
         return Task::none();
     };
 
-    let info_w = if state.viewer.show_info { 281.0 } else { 0.0 };
-    let vp_w = state.viewport_width - info_w;
+    let vp_w = state.viewport_width;
     let vp_h = state.viewport_height - 50.0;
     let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
     let render_w = fit_w * state.viewer.zoom_level;
@@ -1502,8 +1503,8 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
 
     if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
         // Zoom toward cursor. Cursor is in window coords — convert to
-        // viewport-relative coords (subtract info panel and toolbar).
-        let rel_x = anchor_x - info_w;
+        // viewport-relative coords (subtract toolbar).
+        let rel_x = anchor_x;
         let rel_y = anchor_y - 50.0;
         // At zoom=1.0, the image was centered (same as non-zoomed view).
         // The cursor fraction within the image:
@@ -1548,8 +1549,7 @@ fn anchor_zoom_scroll(state: &mut Looky, old_zoom: f32, new_zoom: f32) -> Task<M
         return Task::none();
     };
 
-    let info_w = if state.viewer.show_info { 281.0 } else { 0.0 };
-    let vp_w = state.viewport_width - info_w;
+    let vp_w = state.viewport_width;
     let vp_h = state.viewport_height - 50.0;
     let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
 
@@ -1567,7 +1567,7 @@ fn anchor_zoom_scroll(state: &mut Looky, old_zoom: f32, new_zoom: f32) -> Task<M
 
     if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
         // Cursor position relative to the scrollable viewport
-        let rel_x = anchor_x - info_w;
+        let rel_x = anchor_x;
         let rel_y = anchor_y - 50.0;
 
         // Content position under cursor in the old layout (includes padding)
@@ -1650,6 +1650,7 @@ fn viewer_view<'a>(
     has_prev: bool,
     has_next: bool,
     meta: Option<&'a PhotoMetadata>,
+    show_info: bool,
     zoom_level: f32,
     image_dims: Option<(u32, u32)>,
     viewport_width: f32,
@@ -1665,7 +1666,7 @@ fn viewer_view<'a>(
     } else {
         String::new()
     };
-    let info_label = if meta.is_some() { "Info \u{2190}" } else { "Info \u{2192}" };
+    let info_label = if show_info { "Info \u{2190}" } else { "Info \u{2192}" };
     let toolbar = row![
         button("Back").on_press(Message::BackToGrid),
         button(info_label).on_press(Message::ToggleInfo),
@@ -1680,9 +1681,7 @@ fn viewer_view<'a>(
         let handle = full_handle.or(thumb_handle);
         let image_layer: Element<'a, Message> = if let Some(h) = handle {
             let (img_w, img_h) = image_dims.unwrap_or((800, 600));
-            // Available area for the image (subtract toolbar, info panel)
-            let info_w = if meta.is_some() { 281.0 } else { 0.0 };
-            let avail_w = viewport_width - info_w;
+            let avail_w = viewport_width;
             let avail_h = viewport_height - 50.0;
             let (fit_w, fit_h) = fit_size(img_w, img_h, avail_w, avail_h);
             let render_w = fit_w * zoom_level;
@@ -1691,8 +1690,6 @@ fn viewer_view<'a>(
                 .content_fit(iced::ContentFit::Fill)
                 .width(render_w)
                 .height(render_h);
-            // Ensure the scrollable content is at least viewport-sized so the
-            // image stays centered when it's smaller than the viewport.
             container(img)
                 .center_x(render_w.max(avail_w))
                 .center_y(render_h.max(avail_h))
@@ -1714,9 +1711,16 @@ fn viewer_view<'a>(
                 Message::ZoomScrolled(offset.x, offset.y)
             });
 
-        let body: Element<'_, Message> = if let Some(m) = meta {
-            let panel = info_panel(m);
-            row![panel, zoom_scroll].into()
+        let body: Element<'_, Message> = if show_info {
+            if let Some(m) = meta {
+                let panel = info_panel(m);
+                iced::widget::stack![zoom_scroll, panel]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                zoom_scroll.into()
+            }
         } else {
             zoom_scroll.into()
         };
@@ -1817,14 +1821,21 @@ fn viewer_view<'a>(
         .width(Length::Fill)
         .height(Length::Fill);
 
-    let body: Element<'_, Message> = if let Some(m) = meta {
-        let panel = info_panel(m);
-        row![panel, image_with_nav].into()
+    let body: Element<'_, Message> = if show_info {
+        if let Some(m) = meta {
+            let panel = info_panel(m);
+            iced::widget::stack![image_with_nav, panel]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            image_with_nav.into()
+        }
     } else {
         image_with_nav.into()
     };
 
-    column![toolbar, body,].into()
+    column![toolbar, body].into()
 }
 
 const LABEL_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.55);
@@ -1972,14 +1983,18 @@ fn info_panel(meta: &PhotoMetadata) -> Element<'_, Message> {
 
     let panel_content = scrollable(column(items).spacing(6).padding(16)).height(Length::Fill);
 
-    row![
-        container(panel_content)
-            .width(280)
-            .height(Length::Fill)
-            .style(container::dark),
-        rule::vertical(1),
-    ]
-    .into()
+    container(panel_content)
+        .width(280)
+        .height(Length::Fill)
+        .style(info_panel_style)
+        .into()
+}
+
+fn info_panel_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.1, 0.85))),
+        ..Default::default()
+    }
 }
 
 fn section_header(label: &str) -> Element<'_, Message> {
