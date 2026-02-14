@@ -9,6 +9,9 @@ pub struct ViewerState {
     pub zoom_level: f32,
     pub zoom_target: f32,
     pub zoom_offset: (f32, f32),
+    /// Cursor position in window coordinates when zoom was initiated.
+    /// Used to keep the point under the cursor fixed during zoom animation.
+    pub zoom_anchor: Option<(f32, f32)>,
 }
 
 impl Default for ViewerState {
@@ -20,6 +23,7 @@ impl Default for ViewerState {
             zoom_level: 1.0,
             zoom_target: 1.0,
             zoom_offset: (0.0, 0.0),
+            zoom_anchor: None,
         }
     }
 }
@@ -60,12 +64,14 @@ impl ViewerState {
             self.zoom_target = 2.0;
         }
         self.zoom_offset = (0.0, 0.0);
+        self.zoom_anchor = None;
     }
 
     pub fn reset_zoom(&mut self) {
         self.zoom_level = 1.0;
         self.zoom_target = 1.0;
         self.zoom_offset = (0.0, 0.0);
+        self.zoom_anchor = None;
     }
 
     /// Set zoom target from a scroll delta. The actual zoom_level is animated

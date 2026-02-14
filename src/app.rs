@@ -145,7 +145,7 @@ pub enum Message {
     // Zoom
     ToggleZoom,
     CenterZoomScroll,
-    ZoomAdjust(f32),
+    ZoomAdjust(f32, f32, f32),
     ZoomScrolled(f32, f32),
     // Navigation
     GridScrolled(f32),
@@ -371,10 +371,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::Tick => {
             state.viewer.tick();
+            let old_zoom = state.viewer.zoom_level;
             let crossed_threshold = state.viewer.tick_zoom();
+            let new_zoom = state.viewer.zoom_level;
             if crossed_threshold {
-                // Scrollable just appeared — defer centering by one frame
+                // Scrollable just appeared — defer scroll positioning by one frame
                 return Task::done(Message::CenterZoomScroll);
+            } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                // Zoom level changed during animation — adjust scroll to keep
+                // the anchor point (or center) fixed.
+                return anchor_zoom_scroll(state, old_zoom, new_zoom);
             }
         }
         // Duplicate detection
@@ -550,10 +556,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::CenterZoomScroll => {
             return center_zoom_scroll(state);
         }
-        Message::ZoomAdjust(delta) => {
+        Message::ZoomAdjust(delta, cursor_x, cursor_y) => {
             if state.viewer.current_index.is_some() {
+                // Store cursor position as zoom anchor so the point under the
+                // cursor stays fixed during the animated zoom.
+                state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
                 // Sets zoom_target; actual zoom_level animates via tick_zoom().
-                // Centering is handled when tick_zoom() detects threshold crossing.
                 state.viewer.adjust_zoom(delta);
             }
         }
@@ -904,11 +912,11 @@ fn view(state: &Looky) -> Element<'_, Message> {
             _ => None,
         }
     })
-    .on_scroll(move |delta| {
+    .on_scroll(move |delta, cx, cy| {
         // In the viewer: scroll = zoom. In the grid: return None so the
         // grid scrollable handles it normally.
         if in_viewer {
-            Some(Message::ZoomAdjust(delta))
+            Some(Message::ZoomAdjust(delta, cx, cy))
         } else {
             None
         }
@@ -1386,6 +1394,13 @@ fn fit_size(img_w: u32, img_h: u32, vp_w: f32, vp_h: f32) -> (f32, f32) {
     (img_w as f32 * scale, img_h as f32 * scale)
 }
 
+/// Compute the centering padding for the zoomed image inside the scrollable.
+/// The container is max(render_size, viewport_size), so when the image is smaller
+/// than the viewport, padding centers it.
+fn zoom_padding(render: f32, viewport: f32) -> f32 {
+    ((viewport - render) / 2.0).max(0.0)
+}
+
 fn center_zoom_scroll(state: &Looky) -> Task<Message> {
     let Some(idx) = state.viewer.current_index else {
         return Task::none();
@@ -1400,18 +1415,132 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
     let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
     let render_w = fit_w * state.viewer.zoom_level;
     let render_h = fit_h * state.viewer.zoom_level;
+    let pad_x = zoom_padding(render_w, vp_w);
+    let pad_y = zoom_padding(render_h, vp_h);
 
-    let center_x = ((render_w - vp_w) / 2.0).max(0.0);
-    let center_y = ((render_h - vp_h) / 2.0).max(0.0);
+    if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
+        // Zoom toward cursor. Cursor is in window coords — convert to
+        // viewport-relative coords (subtract info panel and toolbar).
+        let rel_x = anchor_x - info_w;
+        let rel_y = anchor_y - 50.0;
+        // At zoom=1.0, the image was centered (same as non-zoomed view).
+        // The cursor fraction within the image:
+        let img_x = rel_x - pad_x;
+        let img_y = rel_y - pad_y;
+        // Desired scroll: place that image point under the cursor
+        let scroll_x = (img_x + pad_x - rel_x).max(0.0);
+        let scroll_y = (img_y + pad_y - rel_y).max(0.0);
+        // (simplifies to 0 when image < viewport, which is correct)
 
-    use iced::widget::operation::AbsoluteOffset;
-    iced::widget::operation::scroll_to(
-        viewer_scroll_id(),
-        AbsoluteOffset {
-            x: Some(center_x),
-            y: Some(center_y),
-        },
-    )
+        use iced::widget::operation::AbsoluteOffset;
+        iced::widget::operation::scroll_to(
+            viewer_scroll_id(),
+            AbsoluteOffset {
+                x: Some(scroll_x),
+                y: Some(scroll_y),
+            },
+        )
+    } else {
+        // No anchor — center the view
+        let center_x = ((render_w - vp_w) / 2.0).max(0.0);
+        let center_y = ((render_h - vp_h) / 2.0).max(0.0);
+
+        use iced::widget::operation::AbsoluteOffset;
+        iced::widget::operation::scroll_to(
+            viewer_scroll_id(),
+            AbsoluteOffset {
+                x: Some(center_x),
+                y: Some(center_y),
+            },
+        )
+    }
+}
+
+/// Adjust scroll offset during zoom animation to keep the anchor point (or
+/// center) fixed as zoom_level changes from `old_zoom` to `new_zoom`.
+fn anchor_zoom_scroll(state: &mut Looky, old_zoom: f32, new_zoom: f32) -> Task<Message> {
+    let Some(idx) = state.viewer.current_index else {
+        return Task::none();
+    };
+    let Some(&(img_w, img_h)) = state.viewer_dimensions.get(&idx) else {
+        return Task::none();
+    };
+
+    let info_w = if state.viewer.show_info { 281.0 } else { 0.0 };
+    let vp_w = state.viewport_width - info_w;
+    let vp_h = state.viewport_height - 50.0;
+    let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
+
+    let old_render_w = fit_w * old_zoom;
+    let old_render_h = fit_h * old_zoom;
+    let new_render_w = fit_w * new_zoom;
+    let new_render_h = fit_h * new_zoom;
+
+    let old_pad_x = zoom_padding(old_render_w, vp_w);
+    let old_pad_y = zoom_padding(old_render_h, vp_h);
+    let new_pad_x = zoom_padding(new_render_w, vp_w);
+    let new_pad_y = zoom_padding(new_render_h, vp_h);
+
+    let (scroll_x, scroll_y) = state.viewer.zoom_offset;
+
+    if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
+        // Cursor position relative to the scrollable viewport
+        let rel_x = anchor_x - info_w;
+        let rel_y = anchor_y - 50.0;
+
+        // Content position under cursor in the old layout (includes padding)
+        let content_x = scroll_x + rel_x;
+        let content_y = scroll_y + rel_y;
+
+        // Position within the actual image (subtract old padding)
+        let img_x = content_x - old_pad_x;
+        let img_y = content_y - old_pad_y;
+
+        // Scale to new zoom
+        let ratio = new_zoom / old_zoom;
+        let new_img_x = img_x * ratio;
+        let new_img_y = img_y * ratio;
+
+        // Convert back to content coords (add new padding)
+        let new_content_x = new_img_x + new_pad_x;
+        let new_content_y = new_img_y + new_pad_y;
+
+        // Scroll to keep cursor over the same image point
+        let new_scroll_x = (new_content_x - rel_x).max(0.0);
+        let new_scroll_y = (new_content_y - rel_y).max(0.0);
+
+        // Clamp to max scroll (content_size - viewport_size)
+        let content_w = new_render_w.max(vp_w);
+        let content_h = new_render_h.max(vp_h);
+        let max_x = (content_w - vp_w).max(0.0);
+        let max_y = (content_h - vp_h).max(0.0);
+        let new_scroll_x = new_scroll_x.min(max_x);
+        let new_scroll_y = new_scroll_y.min(max_y);
+        state.viewer.zoom_offset = (new_scroll_x, new_scroll_y);
+
+        use iced::widget::operation::AbsoluteOffset;
+        iced::widget::operation::scroll_to(
+            viewer_scroll_id(),
+            AbsoluteOffset {
+                x: Some(new_scroll_x),
+                y: Some(new_scroll_y),
+            },
+        )
+    } else {
+        // No anchor — keep centered
+        let center_x = ((new_render_w - vp_w) / 2.0).max(0.0);
+        let center_y = ((new_render_h - vp_h) / 2.0).max(0.0);
+        state.viewer.zoom_offset = (center_x, center_y);
+
+        use iced::widget::operation::AbsoluteOffset;
+        iced::widget::operation::scroll_to(
+            viewer_scroll_id(),
+            AbsoluteOffset {
+                x: Some(center_x),
+                y: Some(center_y),
+            },
+        )
+    }
 }
 
 fn pan_zoom(state: &mut Looky, dx: f32, dy: f32) -> Task<Message> {
@@ -1474,11 +1603,18 @@ fn viewer_view<'a>(
             let avail_w = viewport_width - info_w;
             let avail_h = viewport_height - 50.0;
             let (fit_w, fit_h) = fit_size(img_w, img_h, avail_w, avail_h);
+            let render_w = fit_w * zoom_level;
+            let render_h = fit_h * zoom_level;
             let img = image(h.clone())
                 .content_fit(iced::ContentFit::Fill)
-                .width(fit_w * zoom_level)
-                .height(fit_h * zoom_level);
-            container(img).into()
+                .width(render_w)
+                .height(render_h);
+            // Ensure the scrollable content is at least viewport-sized so the
+            // image stays centered when it's smaller than the viewport.
+            container(img)
+                .center_x(render_w.max(avail_w))
+                .center_y(render_h.max(avail_h))
+                .into()
         } else {
             container(Space::new()).center(Length::Fill).into()
         };

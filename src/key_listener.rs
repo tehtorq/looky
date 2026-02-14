@@ -15,9 +15,10 @@ use iced::{keyboard, mouse, Element, Event, Length, Rectangle, Size, Vector};
 pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_key_press: Box<dyn Fn(keyboard::Key, bool) -> Option<Message> + 'a>,
-    /// Called on scroll events. If it returns Some, the event is intercepted
-    /// (children like scrollable won't see it). If None, the event passes through.
-    on_scroll: Option<Box<dyn Fn(f32) -> Option<Message> + 'a>>,
+    /// Called on scroll events with (delta, cursor_x, cursor_y).
+    /// If it returns Some, the event is intercepted (children like scrollable
+    /// won't see it). If None, the event passes through.
+    on_scroll: Option<Box<dyn Fn(f32, f32, f32) -> Option<Message> + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
@@ -34,7 +35,7 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
 
     pub fn on_scroll(
         mut self,
-        f: impl Fn(f32) -> Option<Message> + 'a,
+        f: impl Fn(f32, f32, f32) -> Option<Message> + 'a,
     ) -> Self {
         self.on_scroll = Some(Box::new(f));
         self
@@ -105,7 +106,11 @@ where
                     mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
                 };
                 if y.abs() > 0.001 {
-                    if let Some(message) = on_scroll(y) {
+                    let (cx, cy) = cursor
+                        .position()
+                        .map(|p| (p.x, p.y))
+                        .unwrap_or((0.0, 0.0));
+                    if let Some(message) = on_scroll(y, cx, cy) {
                         shell.publish(message);
                         return;
                     }
