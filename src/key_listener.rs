@@ -2,19 +2,28 @@
 //! Unlike subscription-based keyboard handling, messages are produced in the
 //! same frame as the event — no async executor delay.
 //!
-//! Also supports scroll interception for zoom gestures and mouse drag for panning.
+//! Also supports scroll interception for zoom, mouse drag for panning, and
+//! click/right-click callbacks.
 
 use iced::advanced::layout;
 use iced::advanced::overlay;
 use iced::advanced::renderer;
-use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::widget::tree::Tag;
+use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
 use iced::{keyboard, mouse, Element, Event, Length, Point, Rectangle, Size, Vector};
 
+const DRAG_THRESHOLD: f32 = 8.0;
+
 #[derive(Debug, Default)]
 struct State {
+    /// Left button is currently held down.
+    pressed: bool,
+    /// Where the left button was pressed (for click vs drag detection).
+    press_pos: Option<Point>,
+    /// True once the cursor has moved beyond DRAG_THRESHOLD from press_pos.
     dragging: bool,
+    /// Last cursor position (for computing drag deltas).
     last_pos: Option<Point>,
 }
 
@@ -25,6 +34,10 @@ pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Render
     on_scroll: Option<Box<dyn Fn(f32, f32, f32) -> Option<Message> + 'a>>,
     /// Called on mouse drag with (dx, dy). Return Some to consume the event.
     on_drag: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
+    /// Called on left click (press+release without drag) with (cursor_x, cursor_y).
+    on_click: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
+    /// Called on right click with (cursor_x, cursor_y).
+    on_right_click: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
@@ -37,6 +50,8 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
             on_key_press: Box::new(on_key_press),
             on_scroll: None,
             on_drag: None,
+            on_click: None,
+            on_right_click: None,
         }
     }
 
@@ -53,6 +68,22 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
         f: impl Fn(f32, f32) -> Option<Message> + 'a,
     ) -> Self {
         self.on_drag = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_click(
+        mut self,
+        f: impl Fn(f32, f32) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_click = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_right_click(
+        mut self,
+        f: impl Fn(f32, f32) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_right_click = Some(Box::new(f));
         self
     }
 }
@@ -118,35 +149,72 @@ where
     ) {
         let state = tree.state.downcast_mut::<State>();
 
-        // --- Mouse drag handling (before children) ---
-        if let Some(ref on_drag) = self.on_drag {
-            match event {
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    if let Some(pos) = cursor.position() {
-                        state.dragging = true;
+        // --- Left mouse: click vs drag ---
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(pos) = cursor.position() {
+                    state.pressed = true;
+                    state.press_pos = Some(pos);
+                    state.dragging = false;
+                    state.last_pos = Some(pos);
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.pressed {
+                    if let (Some(press), Some(pos)) = (state.press_pos, cursor.position()) {
+                        if !state.dragging {
+                            let dist = ((pos.x - press.x).powi(2) + (pos.y - press.y).powi(2)).sqrt();
+                            if dist > DRAG_THRESHOLD {
+                                state.dragging = true;
+                            }
+                        }
+                        if state.dragging {
+                            if let Some(last) = state.last_pos {
+                                let dx = pos.x - last.x;
+                                let dy = pos.y - last.y;
+                                if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                                    if let Some(ref on_drag) = self.on_drag {
+                                        state.last_pos = Some(pos);
+                                        if let Some(message) = on_drag(dx, dy) {
+                                            shell.publish(message);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         state.last_pos = Some(pos);
                     }
                 }
-                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                    state.dragging = false;
-                    state.last_pos = None;
-                }
-                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                    if state.dragging {
-                        if let (Some(last), Some(pos)) = (state.last_pos, cursor.position()) {
-                            let dx = pos.x - last.x;
-                            let dy = pos.y - last.y;
-                            state.last_pos = Some(pos);
-                            if dx.abs() > 0.5 || dy.abs() > 0.5 {
-                                if let Some(message) = on_drag(dx, dy) {
-                                    shell.publish(message);
-                                    return;
-                                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.pressed && !state.dragging {
+                    // Click (not a drag) — fire on_click
+                    if let Some(ref on_click) = self.on_click {
+                        if let Some(pos) = cursor.position() {
+                            if let Some(message) = on_click(pos.x, pos.y) {
+                                shell.publish(message);
                             }
                         }
                     }
                 }
-                _ => {}
+                state.pressed = false;
+                state.press_pos = None;
+                state.dragging = false;
+                state.last_pos = None;
+            }
+            _ => {}
+        }
+
+        // --- Right click ---
+        if let Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) = event {
+            if let Some(ref on_right_click) = self.on_right_click {
+                if let Some(pos) = cursor.position() {
+                    if let Some(message) = on_right_click(pos.x, pos.y) {
+                        shell.publish(message);
+                        return;
+                    }
+                }
             }
         }
 

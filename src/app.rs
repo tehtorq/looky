@@ -148,6 +148,8 @@ pub enum Message {
     ZoomAdjust(f32, f32, f32),
     ZoomScrolled(f32, f32),
     ViewerDrag(f32, f32),
+    ViewerClickZoom(f32, f32),
+    ViewerClickUnzoom(f32, f32),
     // Navigation
     GridScrolled(f32),
     WindowResized(f32, f32),
@@ -589,6 +591,37 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 return pan_zoom(state, -dx, -dy);
             }
         }
+        Message::ViewerClickZoom(cx, cy) => {
+            if let Some(idx) = state.viewer.current_index {
+                if state.viewer_cache.contains_key(&idx) {
+                    state.viewer.zoom_anchor = Some((cx, cy));
+                    let old_zoom = state.viewer.zoom_level;
+                    state.viewer.adjust_zoom(4.0);
+                    let crossed = state.viewer.tick_zoom();
+                    let new_zoom = state.viewer.zoom_level;
+                    if crossed {
+                        return Task::done(Message::CenterZoomScroll);
+                    } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                        return anchor_zoom_scroll(state, old_zoom, new_zoom);
+                    }
+                }
+            }
+        }
+        Message::ViewerClickUnzoom(cx, cy) => {
+            if let Some(idx) = state.viewer.current_index {
+                if state.viewer_cache.contains_key(&idx) {
+                    state.viewer.zoom_anchor = Some((cx, cy));
+                    let old_zoom = state.viewer.zoom_level;
+                    state.viewer.adjust_zoom(-4.0);
+                    let crossed = state.viewer.tick_zoom();
+                    let new_zoom = state.viewer.zoom_level;
+                    if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                        return anchor_zoom_scroll(state, old_zoom, new_zoom);
+                    }
+                    let _ = crossed;
+                }
+            }
+        }
         // Navigation
         Message::GridScrolled(y) => {
             state.grid_scroll_y = y;
@@ -920,12 +953,21 @@ fn view(state: &Looky) -> Element<'_, Message> {
     KeyListener::new(content, |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
-        match key {
-            // Arrow keys allow repeats for smooth panning
+        match &key {
+            // Arrow/WASD keys allow repeats for smooth panning
             Key::Named(Named::ArrowLeft) => Some(Message::KeyLeft),
             Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
             Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
             Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
+            Key::Character(c) if matches!(c.as_str(), "a" | "w" | "s" | "d") => {
+                match c.as_str() {
+                    "a" => Some(Message::KeyLeft),
+                    "d" => Some(Message::KeyRight),
+                    "w" => Some(Message::KeyUp),
+                    "s" => Some(Message::KeyDown),
+                    _ => None,
+                }
+            }
             _ if repeat => None,
             Key::Named(Named::Space) => Some(Message::ToggleZoom),
             Key::Named(Named::Enter) => Some(Message::KeyEnter),
@@ -934,8 +976,6 @@ fn view(state: &Looky) -> Element<'_, Message> {
         }
     })
     .on_scroll(move |delta, cx, cy| {
-        // In the viewer: scroll = zoom. In the grid: return None so the
-        // grid scrollable handles it normally.
         if in_viewer {
             Some(Message::ZoomAdjust(delta, cx, cy))
         } else {
@@ -945,6 +985,20 @@ fn view(state: &Looky) -> Element<'_, Message> {
     .on_drag(move |dx, dy| {
         if in_viewer {
             Some(Message::ViewerDrag(dx, dy))
+        } else {
+            None
+        }
+    })
+    .on_click(move |cx, cy| {
+        if in_viewer {
+            Some(Message::ViewerClickZoom(cx, cy))
+        } else {
+            None
+        }
+    })
+    .on_right_click(move |cx, cy| {
+        if in_viewer {
+            Some(Message::ViewerClickUnzoom(cx, cy))
         } else {
             None
         }
