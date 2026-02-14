@@ -244,6 +244,16 @@ fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
     (pixels, size, size)
 }
 
+/// Generate a JPEG thumbnail as raw bytes, suitable for HTTP serving.
+pub fn thumbnail_jpeg_bytes(path: &Path, max_size: u32, quality: u8) -> Vec<u8> {
+    use image::ImageEncoder;
+    let (rgba, w, h) = generate_thumbnail(path, max_size);
+    let mut buf = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+    let _ = encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8);
+    buf
+}
+
 /// Fast EXIF thumbnail extraction. Returns (rgba, w, h) or None.
 /// Does NOT check disk cache — that's for the full-quality path.
 pub fn extract_preview(path: &Path, max_size: u32) -> Option<(Vec<u8>, u32, u32)> {

@@ -3,6 +3,7 @@ mod catalog;
 mod duplicates;
 mod key_listener;
 mod metadata;
+mod server;
 mod thumbnail;
 mod viewer;
 mod watcher;

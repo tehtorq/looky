@@ -9,6 +9,7 @@ use crate::catalog::{self, Catalog};
 use crate::duplicates::{self, DuplicateGroup, ImageHashes, MatchKind};
 use crate::key_listener::KeyListener;
 use crate::metadata::{self, PhotoMetadata};
+use crate::server;
 use crate::thumbnail;
 use crate::viewer::ViewerState;
 
@@ -87,6 +88,10 @@ struct Looky {
     screensaver_order: Vec<usize>,
     screensaver_position: usize,
     was_fullscreen: bool,
+    // Sharing server
+    server_handle: Option<server::ServerHandle>,
+    server_url: Option<String>,
+    qr_handle: Option<image::Handle>,
 }
 
 impl Default for Looky {
@@ -126,6 +131,9 @@ impl Default for Looky {
             screensaver_order: Vec::new(),
             screensaver_position: 0,
             was_fullscreen: false,
+            server_handle: None,
+            server_url: None,
+            qr_handle: None,
         }
     }
 }
@@ -169,6 +177,8 @@ pub enum Message {
     // Screensaver
     ToggleScreensaver,
     ScreensaverAdvance,
+    // Sharing
+    ToggleSharing,
     // Navigation
     GridScrolled(f32),
     WindowResized(f32, f32),
@@ -221,6 +231,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::FolderSelected(Some(path)) => {
             save_last_folder(&path);
+            // Stop sharing server on folder change
+            if let Some(handle) = state.server_handle.take() {
+                std::thread::spawn(move || handle.stop());
+            }
+            state.server_url = None;
+            state.qr_handle = None;
             state.folder = Some(path.clone());
             state.thumbnails.clear();
             state.image_paths.clear();
@@ -852,6 +868,32 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             return iced::window::latest()
                 .and_then(move |id| iced::window::set_mode(id, mode));
         }
+        Message::ToggleSharing => {
+            if state.server_handle.is_some() {
+                // Stop
+                if let Some(handle) = state.server_handle.take() {
+                    std::thread::spawn(move || handle.stop());
+                }
+                state.server_url = None;
+                state.qr_handle = None;
+            } else if !state.image_paths.is_empty() {
+                // Start
+                let folder_name = state
+                    .folder
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Photos".to_string());
+                if let Some((handle, url)) = server::start_server(
+                    state.image_paths.clone(),
+                    folder_name,
+                ) {
+                    state.qr_handle = Some(render_qr(&url));
+                    state.server_url = Some(url);
+                    state.server_handle = Some(handle);
+                }
+            }
+        }
     }
     Task::none()
 }
@@ -1308,6 +1350,16 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
         );
     }
 
+    // Share button
+    if !state.image_paths.is_empty() {
+        let share_label = if state.server_handle.is_some() {
+            "Stop Sharing"
+        } else {
+            "Share"
+        };
+        toolbar_items.push(button(share_label).on_press(Message::ToggleSharing).into());
+    }
+
     // Photo count
     if !state.image_paths.is_empty() {
         let count_text = if state.loading {
@@ -1323,14 +1375,26 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
     }
 
     toolbar_items.push(Space::new().width(Length::Fill).into());
-    toolbar_items.push(
-        text(match &state.folder {
-            Some(p) => p.display().to_string(),
-            None => "No folder selected".into(),
-        })
-        .size(14)
-        .into(),
-    );
+
+    // Right side: URL + QR when sharing, otherwise folder path
+    if let (Some(url), Some(qr)) = (&state.server_url, &state.qr_handle) {
+        toolbar_items.push(text(url.as_str()).size(13).color(LABEL_COLOR).into());
+        toolbar_items.push(
+            image(qr.clone())
+                .width(28)
+                .height(28)
+                .into(),
+        );
+    } else {
+        toolbar_items.push(
+            text(match &state.folder {
+                Some(p) => p.display().to_string(),
+                None => "No folder selected".into(),
+            })
+            .size(14)
+            .into(),
+        );
+    }
 
     let toolbar = row(toolbar_items).spacing(10).padding(10);
 
@@ -2270,6 +2334,36 @@ fn info_field(label: &str, value: String) -> Element<'_, Message> {
     ]
     .spacing(8)
     .into()
+}
+
+fn render_qr(url: &str) -> image::Handle {
+    use qrcode::QrCode;
+    let code = QrCode::new(url.as_bytes()).unwrap();
+    let modules = code.to_colors();
+    let size = code.width();
+    let scale = 4u32;
+    let quiet = 2u32;
+    let img_size = (size as u32) * scale + quiet * 2 * scale;
+    let mut pixels = vec![255u8; (img_size * img_size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let dark = modules[y * size + x] == qrcode::Color::Dark;
+            if dark {
+                let px = x as u32 * scale + quiet * scale;
+                let py = y as u32 * scale + quiet * scale;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let offset = ((py + dy) * img_size + (px + dx)) as usize * 4;
+                        pixels[offset] = 0;
+                        pixels[offset + 1] = 0;
+                        pixels[offset + 2] = 0;
+                        pixels[offset + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    image::Handle::from_rgba(img_size, img_size, pixels)
 }
 
 fn theme(_state: &Looky) -> Theme {
