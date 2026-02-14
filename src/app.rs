@@ -563,6 +563,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
                 // Sets zoom_target; actual zoom_level animates via tick_zoom().
                 state.viewer.adjust_zoom(delta);
+                // Kick off animation immediately rather than waiting for the
+                // subscription timer to start (avoids startup delay).
+                return Task::done(Message::Tick);
             }
         }
         Message::ZoomScrolled(x, y) => {

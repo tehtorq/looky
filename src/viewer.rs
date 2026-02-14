@@ -79,6 +79,12 @@ impl ViewerState {
     pub fn adjust_zoom(&mut self, delta: f32) {
         let factor = 2.0_f32.powf(delta * 0.15);
         self.zoom_target = (self.zoom_target * factor).clamp(1.0, 8.0);
+        // Don't let target race too far ahead of current level — prevents
+        // large jumps when scroll events accumulate before animation starts.
+        self.zoom_target = self
+            .zoom_target
+            .clamp(self.zoom_level / 1.5, self.zoom_level * 1.5);
+        self.zoom_target = self.zoom_target.clamp(1.0, 8.0);
         if self.zoom_target < 1.02 {
             self.zoom_target = 1.0;
         }
