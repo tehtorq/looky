@@ -73,6 +73,7 @@ struct Looky {
     dup_compare: Option<usize>,
     dup_summaries: HashMap<usize, metadata::FileSummary>,
     grid_scroll_y: f32,
+    dup_scroll_y: f32,
     grid_columns: usize,
     viewport_width: f32,
     viewport_height: f32,
@@ -112,6 +113,7 @@ impl Default for Looky {
             dup_compare: None,
             dup_summaries: HashMap::new(),
             grid_scroll_y: 0.0,
+            dup_scroll_y: 0.0,
             grid_columns: 4,
             viewport_width: 800.0,
             viewport_height: 600.0,
@@ -159,8 +161,11 @@ pub enum Message {
     ZoomAdjust(f32, f32, f32),
     ZoomScrolled(f32, f32),
     ViewerDrag(f32, f32),
+    DragScroll(f32, f32),
+    DupListScrolled(f32),
     ViewerClickZoom(f32, f32),
     ViewerClickUnzoom(f32, f32),
+    PinchZoom(f32, f32, f32),
     // Screensaver
     ToggleScreensaver,
     ScreensaverAdvance,
@@ -549,6 +554,7 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ShowDuplicatesView => {
             state.dup_view_active = true;
             state.dup_compare = None;
+            state.dup_scroll_y = 0.0;
         }
         Message::BackFromDuplicates => {
             state.dup_view_active = false;
@@ -608,6 +614,23 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 return pan_zoom(state, -dx, -dy);
             }
         }
+        Message::DragScroll(_dx, dy) => {
+            let (scroll_id, scroll_y) = if state.dup_view_active {
+                (dup_list_scroll_id(), &mut state.dup_scroll_y)
+            } else {
+                (grid_scroll_id(), &mut state.grid_scroll_y)
+            };
+            let new_y = (*scroll_y - dy).max(0.0);
+            *scroll_y = new_y;
+            use iced::widget::operation::AbsoluteOffset;
+            return iced::widget::operation::scroll_to(
+                scroll_id,
+                AbsoluteOffset { x: None, y: Some(new_y) },
+            );
+        }
+        Message::DupListScrolled(y) => {
+            state.dup_scroll_y = y;
+        }
         Message::ViewerClickZoom(cx, cy) => {
             if let Some(idx) = state.viewer.current_index {
                 if state.viewer_cache.contains_key(&idx) {
@@ -634,6 +657,25 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                         return anchor_zoom_scroll(state, old_zoom, new_zoom);
                     }
                     let _ = crossed;
+                }
+            }
+        }
+        Message::PinchZoom(scale, cx, cy) => {
+            if let Some(idx) = state.viewer.current_index {
+                if !state.viewer_cache.contains_key(&idx) {
+                    return Task::none();
+                }
+                state.viewer.zoom_anchor = Some((cx, cy));
+                let old_zoom = state.viewer.zoom_level;
+                let new_zoom = (old_zoom * scale).clamp(1.0, 8.0);
+                let new_zoom = if new_zoom < 1.02 { 1.0 } else { new_zoom };
+                state.viewer.zoom_level = new_zoom;
+                state.viewer.zoom_target = new_zoom;
+                if new_zoom > 1.0 && (new_zoom - old_zoom).abs() > 0.001 {
+                    return anchor_zoom_scroll(state, old_zoom, new_zoom);
+                }
+                if new_zoom <= 1.0 && old_zoom > 1.0 {
+                    state.viewer.zoom_offset = (0.0, 0.0);
                 }
             }
         }
@@ -816,6 +858,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
 
 fn grid_scroll_id() -> iced::widget::Id {
     iced::widget::Id::new("grid")
+}
+
+fn dup_list_scroll_id() -> iced::widget::Id {
+    iced::widget::Id::new("dup-list")
 }
 
 fn move_grid_selection(state: &mut Looky, delta: i32) -> Task<Message> {
@@ -1145,7 +1191,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
         if in_viewer {
             Some(Message::ViewerDrag(dx, dy))
         } else {
-            None
+            Some(Message::DragScroll(dx, dy))
         }
     })
     .on_click(move |cx, cy| {
@@ -1160,6 +1206,14 @@ fn view(state: &Looky) -> Element<'_, Message> {
         if screensaver { return None; }
         if in_viewer {
             Some(Message::ViewerClickUnzoom(cx, cy))
+        } else {
+            None
+        }
+    })
+    .on_pinch(move |scale, cx, cy| {
+        if screensaver { return None; }
+        if in_viewer {
+            Some(Message::PinchZoom(scale, cx, cy))
         } else {
             None
         }
@@ -1532,7 +1586,10 @@ fn duplicates_list_view(state: &Looky) -> Element<'_, Message> {
         })
         .collect();
 
-    let list = scrollable(column(cards).spacing(12).padding(16)).height(Length::Fill);
+    let list = scrollable(column(cards).spacing(12).padding(16))
+        .id(dup_list_scroll_id())
+        .on_scroll(|vp| Message::DupListScrolled(vp.absolute_offset().y))
+        .height(Length::Fill);
 
     container(column![toolbar, list]).into()
 }

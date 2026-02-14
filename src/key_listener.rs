@@ -5,13 +5,15 @@
 //! Also supports scroll interception for zoom, mouse drag for panning, and
 //! click/right-click callbacks.
 
+use std::collections::HashMap;
+
 use iced::advanced::layout;
 use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::tree::Tag;
 use iced::advanced::widget::{Operation, Tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
-use iced::{keyboard, mouse, Element, Event, Length, Point, Rectangle, Size, Vector};
+use iced::{keyboard, mouse, touch, Element, Event, Length, Point, Rectangle, Size, Vector};
 
 const DRAG_THRESHOLD: f32 = 8.0;
 
@@ -25,6 +27,12 @@ struct State {
     dragging: bool,
     /// Last cursor position (for computing drag deltas).
     last_pos: Option<Point>,
+    /// Active touch finger positions (for pinch-to-zoom and touch drag).
+    touches: HashMap<touch::Finger, Point>,
+    /// Previous distance between two fingers during a pinch gesture.
+    pinch_last_distance: Option<f32>,
+    /// True after a pinch ends, to prevent the remaining finger from triggering drag.
+    was_pinching: bool,
 }
 
 pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
@@ -38,6 +46,8 @@ pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Render
     on_click: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
     /// Called on right click with (cursor_x, cursor_y).
     on_right_click: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
+    /// Called on pinch gesture with (scale, center_x, center_y).
+    on_pinch: Option<Box<dyn Fn(f32, f32, f32) -> Option<Message> + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
@@ -52,6 +62,7 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
             on_drag: None,
             on_click: None,
             on_right_click: None,
+            on_pinch: None,
         }
     }
 
@@ -84,6 +95,14 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
         f: impl Fn(f32, f32) -> Option<Message> + 'a,
     ) -> Self {
         self.on_right_click = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_pinch(
+        mut self,
+        f: impl Fn(f32, f32, f32) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_pinch = Some(Box::new(f));
         self
     }
 }
@@ -212,6 +231,70 @@ where
             }
         }
 
+        // --- Touch interception (before children): single-finger drag + pinch ---
+        if let Event::Touch(touch_event) = event {
+            match touch_event {
+                touch::Event::FingerPressed { id, position } => {
+                    state.touches.insert(*id, *position);
+                    if state.touches.len() == 2 {
+                        let pts: Vec<Point> = state.touches.values().copied().collect();
+                        let dist = distance(pts[0], pts[1]);
+                        state.pinch_last_distance = Some(dist);
+                    }
+                }
+                touch::Event::FingerMoved { id, position } => {
+                    let old_pos = state.touches.get(id).copied();
+                    state.touches.insert(*id, *position);
+                    if state.touches.len() == 1 && !state.was_pinching {
+                        // Single-finger drag — fire on_drag with deltas
+                        if let Some(old) = old_pos {
+                            let dx = position.x - old.x;
+                            let dy = position.y - old.y;
+                            if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                                if let Some(ref on_drag) = self.on_drag {
+                                    if let Some(msg) = on_drag(dx, dy) {
+                                        shell.publish(msg);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    } else if state.touches.len() == 2 {
+                        if let Some(ref on_pinch) = self.on_pinch {
+                            let pts: Vec<Point> = state.touches.values().copied().collect();
+                            let dist = distance(pts[0], pts[1]);
+                            if let Some(prev_dist) = state.pinch_last_distance {
+                                if prev_dist > 1.0 && dist > 1.0 {
+                                    let scale = dist / prev_dist;
+                                    let cx = (pts[0].x + pts[1].x) / 2.0;
+                                    let cy = (pts[0].y + pts[1].y) / 2.0;
+                                    state.pinch_last_distance = Some(dist);
+                                    if let Some(msg) = on_pinch(scale, cx, cy) {
+                                        shell.publish(msg);
+                                        return;
+                                    }
+                                }
+                            }
+                            state.pinch_last_distance = Some(dist);
+                        }
+                    }
+                }
+                touch::Event::FingerLifted { id, .. }
+                | touch::Event::FingerLost { id, .. } => {
+                    state.touches.remove(id);
+                    if state.touches.len() < 2 {
+                        if state.pinch_last_distance.is_some() {
+                            state.was_pinching = true;
+                        }
+                        state.pinch_last_distance = None;
+                    }
+                    if state.touches.is_empty() {
+                        state.was_pinching = false;
+                    }
+                }
+            }
+        }
+
         // --- Pass event to children ---
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -326,6 +409,10 @@ where
             translation,
         )
     }
+}
+
+fn distance(a: Point, b: Point) -> f32 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
 }
 
 impl<'a, Message, Theme, Renderer> From<KeyListener<'a, Message, Theme, Renderer>>
