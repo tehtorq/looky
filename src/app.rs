@@ -80,6 +80,7 @@ struct Looky {
     viewer_cache: HashMap<usize, image::Handle>,
     viewer_dimensions: HashMap<usize, (u32, u32)>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
+    boot_time: Instant,
 }
 
 impl Default for Looky {
@@ -113,6 +114,7 @@ impl Default for Looky {
             viewer_cache: HashMap::new(),
             viewer_dimensions: HashMap::new(),
             viewer_preload_handles: Vec::new(),
+            boot_time: Instant::now(),
         }
     }
 }
@@ -189,6 +191,28 @@ fn thumbnails_fading(state: &Looky) -> bool {
 }
 
 fn update(state: &mut Looky, message: Message) -> Task<Message> {
+    // Zoom pipeline timing: log ALL messages while zoom is active or animating
+    if state.viewer.zoom_target > 1.0 || state.viewer.zoom_level > 1.0
+        || matches!(&message, Message::ZoomAdjust(..) | Message::ViewerImageLoaded(..))
+    {
+        let now = Instant::now();
+        let tag = match &message {
+            Message::ZoomAdjust(d, ..) => format!("ZoomAdjust(delta={:.3})", d),
+            Message::Tick => "Tick".to_string(),
+            Message::CenterZoomScroll => "CenterZoomScroll".to_string(),
+            Message::ViewerImageLoaded(idx, _, w, h) => format!("ViewerImageLoaded(idx={}, {}x{})", idx, w, h),
+            Message::ZoomScrolled(..) => "ZoomScrolled".to_string(),
+            Message::NextImage => "NextImage".to_string(),
+            Message::PrevImage => "PrevImage".to_string(),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        };
+        eprintln!("[{:>10.3}ms] update: {:<40} | zl={:.3} zt={:.3}",
+            now.duration_since(state.boot_time).as_secs_f64() * 1000.0,
+            tag,
+            state.viewer.zoom_level,
+            state.viewer.zoom_target,
+        );
+    }
     match message {
         Message::OpenFolder => {
             return Task::perform(pick_folder(), Message::FolderSelected);
@@ -558,14 +582,19 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::ZoomAdjust(delta, cursor_x, cursor_y) => {
             if state.viewer.current_index.is_some() {
-                // Store cursor position as zoom anchor so the point under the
-                // cursor stays fixed during the animated zoom.
                 state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
-                // Sets zoom_target; actual zoom_level animates via tick_zoom().
+                let old_zoom = state.viewer.zoom_level;
                 state.viewer.adjust_zoom(delta);
-                // Kick off animation immediately rather than waiting for the
-                // subscription timer to start (avoids startup delay).
-                return Task::done(Message::Tick);
+                // Step zoom_level directly toward target instead of waiting for
+                // a Tick message — Tick can be blocked by slow render passes on
+                // large images, causing zoom to appear frozen.
+                let crossed = state.viewer.tick_zoom();
+                let new_zoom = state.viewer.zoom_level;
+                if crossed {
+                    return Task::done(Message::CenterZoomScroll);
+                } else if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+                    return anchor_zoom_scroll(state, old_zoom, new_zoom);
+                }
             }
         }
         Message::ZoomScrolled(x, y) => {
