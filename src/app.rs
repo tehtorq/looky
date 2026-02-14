@@ -147,6 +147,7 @@ pub enum Message {
     CenterZoomScroll,
     ZoomAdjust(f32, f32, f32),
     ZoomScrolled(f32, f32),
+    ViewerDrag(f32, f32),
     // Navigation
     GridScrolled(f32),
     WindowResized(f32, f32),
@@ -582,6 +583,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ZoomScrolled(x, y) => {
             state.viewer.zoom_offset = (x, y);
         }
+        Message::ViewerDrag(dx, dy) => {
+            if state.viewer.is_zoomed() {
+                // Drag in opposite direction: pull image right → scroll left
+                return pan_zoom(state, -dx, -dy);
+            }
+        }
         // Navigation
         Message::GridScrolled(y) => {
             state.grid_scroll_y = y;
@@ -931,6 +938,13 @@ fn view(state: &Looky) -> Element<'_, Message> {
         // grid scrollable handles it normally.
         if in_viewer {
             Some(Message::ZoomAdjust(delta, cx, cy))
+        } else {
+            None
+        }
+    })
+    .on_drag(move |dx, dy| {
+        if in_viewer {
+            Some(Message::ViewerDrag(dx, dy))
         } else {
             None
         }

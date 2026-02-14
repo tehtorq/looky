@@ -2,23 +2,29 @@
 //! Unlike subscription-based keyboard handling, messages are produced in the
 //! same frame as the event — no async executor delay.
 //!
-//! Also supports Ctrl+scroll interception for zoom gestures (including
-//! trackpad pinch-to-zoom which maps to Ctrl+scroll on Linux).
+//! Also supports scroll interception for zoom gestures and mouse drag for panning.
 
 use iced::advanced::layout;
 use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::{Operation, Tree};
+use iced::advanced::widget::tree::Tag;
 use iced::advanced::{Clipboard, Layout, Shell, Widget};
-use iced::{keyboard, mouse, Element, Event, Length, Rectangle, Size, Vector};
+use iced::{keyboard, mouse, Element, Event, Length, Point, Rectangle, Size, Vector};
+
+#[derive(Debug, Default)]
+struct State {
+    dragging: bool,
+    last_pos: Option<Point>,
+}
 
 pub struct KeyListener<'a, Message, Theme = iced::Theme, Renderer = iced::Renderer> {
     content: Element<'a, Message, Theme, Renderer>,
     on_key_press: Box<dyn Fn(keyboard::Key, bool) -> Option<Message> + 'a>,
     /// Called on scroll events with (delta, cursor_x, cursor_y).
-    /// If it returns Some, the event is intercepted (children like scrollable
-    /// won't see it). If None, the event passes through.
     on_scroll: Option<Box<dyn Fn(f32, f32, f32) -> Option<Message> + 'a>>,
+    /// Called on mouse drag with (dx, dy). Return Some to consume the event.
+    on_drag: Option<Box<dyn Fn(f32, f32) -> Option<Message> + 'a>>,
 }
 
 impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
@@ -30,6 +36,7 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
             content: content.into(),
             on_key_press: Box::new(on_key_press),
             on_scroll: None,
+            on_drag: None,
         }
     }
 
@@ -40,6 +47,14 @@ impl<'a, Message, Theme, Renderer> KeyListener<'a, Message, Theme, Renderer> {
         self.on_scroll = Some(Box::new(f));
         self
     }
+
+    pub fn on_drag(
+        mut self,
+        f: impl Fn(f32, f32) -> Option<Message> + 'a,
+    ) -> Self {
+        self.on_drag = Some(Box::new(f));
+        self
+    }
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -47,6 +62,14 @@ impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
 where
     Renderer: iced::advanced::Renderer,
 {
+    fn tag(&self) -> Tag {
+        Tag::of::<State>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(State::default())
+    }
+
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
     }
@@ -93,14 +116,43 @@ where
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        // Check scroll events BEFORE children so we can intercept them.
-        // If the callback returns Some, we consume the event (the scrollable
-        // won't see it). If None, we let it pass through to children.
+        let state = tree.state.downcast_mut::<State>();
+
+        // --- Mouse drag handling (before children) ---
+        if let Some(ref on_drag) = self.on_drag {
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    if let Some(pos) = cursor.position() {
+                        state.dragging = true;
+                        state.last_pos = Some(pos);
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    state.dragging = false;
+                    state.last_pos = None;
+                }
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if state.dragging {
+                        if let (Some(last), Some(pos)) = (state.last_pos, cursor.position()) {
+                            let dx = pos.x - last.x;
+                            let dy = pos.y - last.y;
+                            state.last_pos = Some(pos);
+                            if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                                if let Some(message) = on_drag(dx, dy) {
+                                    shell.publish(message);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // --- Scroll interception (before children) ---
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
             if let Some(ref on_scroll) = self.on_scroll {
-                // Normalize to "line" units (~1.0 per mouse wheel click).
-                // Trackpad pixel events use /40 so a typical swipe
-                // (≈200-400px total over many events) maps to several "lines".
                 let y = match delta {
                     mouse::ScrollDelta::Lines { y, .. } => *y,
                     mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
@@ -170,6 +222,10 @@ where
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> iced::mouse::Interaction {
+        let state = tree.state.downcast_ref::<State>();
+        if state.dragging {
+            return iced::mouse::Interaction::Grabbing;
+        }
         self.content
             .as_widget()
             .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
