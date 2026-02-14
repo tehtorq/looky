@@ -80,7 +80,6 @@ struct Looky {
     viewer_cache: HashMap<usize, image::Handle>,
     viewer_dimensions: HashMap<usize, (u32, u32)>,
     viewer_preload_handles: Vec<(usize, iced::task::Handle)>,
-    boot_time: Instant,
 }
 
 impl Default for Looky {
@@ -114,7 +113,6 @@ impl Default for Looky {
             viewer_cache: HashMap::new(),
             viewer_dimensions: HashMap::new(),
             viewer_preload_handles: Vec::new(),
-            boot_time: Instant::now(),
         }
     }
 }
@@ -191,28 +189,6 @@ fn thumbnails_fading(state: &Looky) -> bool {
 }
 
 fn update(state: &mut Looky, message: Message) -> Task<Message> {
-    // Zoom pipeline timing: log ALL messages while zoom is active or animating
-    if state.viewer.zoom_target > 1.0 || state.viewer.zoom_level > 1.0
-        || matches!(&message, Message::ZoomAdjust(..) | Message::ViewerImageLoaded(..))
-    {
-        let now = Instant::now();
-        let tag = match &message {
-            Message::ZoomAdjust(d, ..) => format!("ZoomAdjust(delta={:.3})", d),
-            Message::Tick => "Tick".to_string(),
-            Message::CenterZoomScroll => "CenterZoomScroll".to_string(),
-            Message::ViewerImageLoaded(idx, _, w, h) => format!("ViewerImageLoaded(idx={}, {}x{})", idx, w, h),
-            Message::ZoomScrolled(..) => "ZoomScrolled".to_string(),
-            Message::NextImage => "NextImage".to_string(),
-            Message::PrevImage => "PrevImage".to_string(),
-            other => format!("{:?}", std::mem::discriminant(other)),
-        };
-        eprintln!("[{:>10.3}ms] update: {:<40} | zl={:.3} zt={:.3}",
-            now.duration_since(state.boot_time).as_secs_f64() * 1000.0,
-            tag,
-            state.viewer.zoom_level,
-            state.viewer.zoom_target,
-        );
-    }
     match message {
         Message::OpenFolder => {
             return Task::perform(pick_folder(), Message::FolderSelected);
@@ -561,9 +537,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         // Zoom
         Message::ToggleZoom => {
-            if state.viewer.current_index.is_some() {
-                // Sets zoom_target; actual zoom_level animates via tick_zoom().
-                // Centering is handled when tick_zoom() detects threshold crossing.
+            if let Some(idx) = state.viewer.current_index {
+                if !state.viewer_cache.contains_key(&idx) {
+                    return Task::none();
+                }
                 state.viewer.toggle_zoom();
             } else if let Some(idx) = state.selected_thumb {
                 // In grid: open selected image (current Space behavior)
@@ -581,7 +558,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             return center_zoom_scroll(state);
         }
         Message::ZoomAdjust(delta, cursor_x, cursor_y) => {
-            if state.viewer.current_index.is_some() {
+            if let Some(idx) = state.viewer.current_index {
+                // Don't zoom until the full-res image is loaded — zooming the
+                // thumbnail gives wrong dimensions and stretches badly.
+                if !state.viewer_cache.contains_key(&idx) {
+                    return Task::none();
+                }
                 state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
                 let old_zoom = state.viewer.zoom_level;
                 state.viewer.adjust_zoom(delta);

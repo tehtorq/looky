@@ -106,7 +106,6 @@ where
                     mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
                 };
                 if y.abs() > 0.001 {
-                    eprintln!("[scroll event] y={:.3}", y);
                     let (cx, cy) = cursor
                         .position()
                         .map(|p| (p.x, p.y))
