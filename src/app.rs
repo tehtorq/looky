@@ -1844,7 +1844,12 @@ fn info_panel(meta: &PhotoMetadata) -> Element<'_, Message> {
     let mut items: Vec<Element<'_, Message>> = Vec::new();
 
     // File header
-    items.push(text(&meta.filename).size(15).into());
+    items.push(
+        text(&meta.filename)
+            .size(15)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .into(),
+    );
     items.push(
         text(metadata::format_file_size(meta.file_size))
             .size(12)
@@ -1981,18 +1986,25 @@ fn info_panel(meta: &PhotoMetadata) -> Element<'_, Message> {
         }
     }
 
-    let panel_content = scrollable(column(items).spacing(6).padding(16)).height(Length::Fill);
+    let panel_content = column(items).spacing(6).padding(16).width(280);
 
-    container(panel_content)
-        .width(280)
-        .height(Length::Fill)
-        .style(info_panel_style)
-        .into()
+    container(
+        container(panel_content)
+            .width(280)
+            .clip(true)
+            .style(info_panel_style),
+    )
+    .padding(12)
+    .into()
 }
 
 fn info_panel_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.1, 0.85))),
+        border: iced::Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
