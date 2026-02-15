@@ -310,7 +310,12 @@ where
         if shell.is_event_captured() {
             // A child widget (button, etc.) handled this event — clean up
             // press state but don't fire click callbacks.
-            if matches!(event, Event::Mouse(mouse::Event::ButtonReleased(..))) {
+            if matches!(
+                event,
+                Event::Mouse(
+                    mouse::Event::ButtonPressed(..) | mouse::Event::ButtonReleased(..)
+                )
+            ) {
                 state.pressed = false;
                 state.press_pos = None;
                 state.dragging = false;

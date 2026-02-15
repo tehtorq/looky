@@ -97,6 +97,7 @@ struct Looky {
     cast_scanning: bool,
     cast_devices: Vec<server::cast::CastTarget>,
     cast_error: Option<String>,
+    menu_open: bool,
 }
 
 impl Default for Looky {
@@ -143,6 +144,7 @@ impl Default for Looky {
             cast_scanning: false,
             cast_devices: Vec::new(),
             cast_error: None,
+            menu_open: false,
         }
     }
 }
@@ -204,6 +206,7 @@ pub enum Message {
     KeyDown,
     KeyEnter,
     ToggleFullscreen,
+    ToggleMenu,
 }
 
 fn subscription(state: &Looky) -> Subscription<Message> {
@@ -240,6 +243,23 @@ fn thumbnails_fading(state: &Looky) -> bool {
 }
 
 fn update(state: &mut Looky, message: Message) -> Task<Message> {
+    // Close menu when a menu-item action is triggered
+    if state.menu_open {
+        let close_menu = matches!(
+            message,
+            Message::OpenFolder
+                | Message::ShowDuplicatesView
+                | Message::ToggleScreensaver
+                | Message::BackToGrid
+                | Message::ToggleInfo
+                | Message::ToggleFullscreen
+                | Message::BackFromDuplicates
+                | Message::BackFromCompare
+        );
+        if close_menu {
+            state.menu_open = false;
+        }
+    }
     match message {
         Message::OpenFolder => {
             return Task::perform(pick_folder(), Message::FolderSelected);
@@ -945,6 +965,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.cast_devices.clear();
             state.cast_error = None;
         }
+        Message::ToggleMenu => {
+            state.menu_open = !state.menu_open;
+        }
     }
     Task::none()
 }
@@ -1000,7 +1023,7 @@ fn scroll_to_thumb(state: &Looky, index: usize) -> Task<Message> {
     // If the row is above the current scroll, scroll up to it.
     // If it's below, scroll down so it's visible.
     // We don't know the viewport height exactly, so use a conservative estimate.
-    let viewport = state.viewport_height - 50.0; // subtract toolbar height
+    let viewport = state.viewport_height;
     let target = if row_top < state.grid_scroll_y {
         row_top
     } else if row_bottom > state.grid_scroll_y + viewport {
@@ -1030,9 +1053,8 @@ fn restore_grid_scroll(state: &Looky) -> Task<Message> {
 
 fn visible_index_range(state: &Looky) -> std::ops::Range<usize> {
     let cols = state.grid_columns.max(1);
-    let toolbar_height = 50.0;
     let first_row = (state.grid_scroll_y / THUMB_CELL).floor().max(0.0) as usize;
-    let visible_rows = ((state.viewport_height - toolbar_height) / THUMB_CELL).ceil() as usize + 1;
+    let visible_rows = (state.viewport_height / THUMB_CELL).ceil() as usize + 1;
     let first_idx = first_row * cols;
     let last_idx = ((first_row + visible_rows) * cols).min(state.thumbnails.len());
     first_idx..last_idx
@@ -1243,6 +1265,7 @@ fn view(state: &Looky) -> Element<'_, Message> {
     let content = view_inner(state);
     let in_viewer = state.viewer.current_index.is_some();
     let screensaver = state.screensaver_active;
+    let menu_open = state.menu_open;
     KeyListener::new(content, move |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
@@ -1271,7 +1294,13 @@ fn view(state: &Looky) -> Element<'_, Message> {
             _ if repeat => None,
             Key::Named(Named::Space) => Some(Message::ToggleZoom),
             Key::Named(Named::Enter) => Some(Message::KeyEnter),
-            Key::Named(Named::Escape) => Some(Message::KeyEscape),
+            Key::Named(Named::Escape) => {
+                if menu_open {
+                    Some(Message::ToggleMenu)
+                } else {
+                    Some(Message::KeyEscape)
+                }
+            }
             Key::Character(c) if c.as_str() == "i" => {
                 if repeat { return None; }
                 Some(Message::ToggleInfo)
@@ -1331,199 +1360,79 @@ fn view(state: &Looky) -> Element<'_, Message> {
 }
 
 fn view_inner(state: &Looky) -> Element<'_, Message> {
-    // 1. Single-image viewer
-    if let Some(index) = state.viewer.current_index {
-        if let Some(path) = state.image_paths.get(index) {
-            let has_prev = index > 0;
-            let has_next = index + 1 < state.image_paths.len();
+    // Screensaver: no menu overlay
+    if state.screensaver_active {
+        if let Some(index) = state.viewer.current_index {
+            if state.image_paths.get(index).is_some() {
+                let full_handle = state.viewer_cache.get(&index);
+                let thumb_handle = state.thumbnails.get(index).map(|(_, h, _)| h);
+                return viewer_view(
+                    thumb_handle,
+                    full_handle,
+                    index > 0,
+                    index + 1 < state.image_paths.len(),
+                    state.cached_metadata.as_ref().map(|(_, m)| m),
+                    state.viewer.show_info,
+                    state.viewer.zoom_level,
+                    state.viewer_dimensions.get(&index).copied(),
+                    state.viewport_width,
+                    state.viewport_height,
+                    true,
+                );
+            }
+        }
+    }
 
+    // Build view content (without toolbars)
+    let content: Element<'_, Message> = if let Some(index) = state.viewer.current_index {
+        if state.image_paths.get(index).is_some() {
             let full_handle = state.viewer_cache.get(&index);
             let thumb_handle = state.thumbnails.get(index).map(|(_, h, _)| h);
-
-            let meta = state.cached_metadata.as_ref().map(|(_, m)| m);
-            let show_info = state.viewer.show_info;
-
-            let zoom_level = state.viewer.zoom_level;
-            let image_dims = state.viewer_dimensions.get(&index).copied();
-
-            return viewer_view(
-                path,
+            viewer_view(
                 thumb_handle,
                 full_handle,
-                index,
-                state.image_paths.len(),
-                has_prev,
-                has_next,
-                meta,
-                show_info,
-                state.fullscreen,
-                zoom_level,
-                image_dims,
+                index > 0,
+                index + 1 < state.image_paths.len(),
+                state.cached_metadata.as_ref().map(|(_, m)| m),
+                state.viewer.show_info,
+                state.viewer.zoom_level,
+                state.viewer_dimensions.get(&index).copied(),
                 state.viewport_width,
                 state.viewport_height,
-                state.screensaver_active,
-            );
-        }
-    }
-
-    // 2. Side-by-side comparison view
-    if let Some(group_idx) = state.dup_compare {
-        if let Some(group) = state.dup_groups.get(group_idx) {
-            return duplicates_compare_view(state, group);
-        }
-    }
-
-    // 3. Duplicates list view
-    if state.dup_view_active {
-        return duplicates_list_view(state);
-    }
-
-    // 4. Grid view with toolbar
-    let mut toolbar_items: Vec<Element<'_, Message>> = vec![
-        button("Open Folder").on_press(Message::OpenFolder).into(),
-    ];
-
-    // "Find Duplicates" / "Scanning..." button
-    if !state.image_paths.is_empty() {
-        if state.dup_scanning {
-            let scanned = state.dup_total - state.dup_pending.len();
-            toolbar_items.push(
-                text(format!("Scanning {} / {}...", scanned, state.dup_total))
-                    .size(13)
-                    .color(LABEL_COLOR)
-                    .into(),
-            );
-            toolbar_items.push(
-                button("Cancel")
-                    .on_press(Message::CancelDupScan)
-                    .into(),
-            );
-        } else {
-            let scan_label = if state.dup_groups.is_empty() {
-                "Find Duplicates"
-            } else {
-                "Scan for new"
-            };
-            toolbar_items.push(button(scan_label).on_press(Message::FindDuplicates).into());
-        }
-    }
-
-    // "Duplicates (N)" button when groups found
-    if !state.dup_groups.is_empty() {
-        toolbar_items.push(
-            button(text(format!("Duplicates ({})", state.dup_groups.len())))
-                .on_press(Message::ShowDuplicatesView)
-                .into(),
-        );
-    }
-
-    // Screensaver button
-    if !state.image_paths.is_empty() {
-        let ss_label = if state.screensaver_active {
-            "Stop Screensaver"
-        } else {
-            "Screensaver"
-        };
-        toolbar_items.push(button(ss_label).on_press(Message::ToggleScreensaver).into());
-    }
-
-    // Share button
-    if !state.image_paths.is_empty() {
-        let share_label = if state.server_handle.is_some() {
-            "Stop Sharing"
-        } else {
-            "Share"
-        };
-        toolbar_items.push(button(share_label).on_press(Message::ToggleSharing).into());
-    }
-
-    // Cast to TV (only when sharing is active)
-    if state.server_handle.is_some() {
-        if let Some(device) = &state.cast_device {
-            toolbar_items.push(
-                text(format!("TV: {}", device.name))
-                    .size(13)
-                    .color(LABEL_COLOR)
-                    .into(),
-            );
-            toolbar_items.push(button("Stop Cast").on_press(Message::StopCast).into());
-        } else if state.cast_scanning {
-            toolbar_items.push(text("Scanning...").size(13).color(LABEL_COLOR).into());
-        } else if !state.cast_devices.is_empty() {
-            for (i, dev) in state.cast_devices.iter().enumerate() {
-                toolbar_items
-                    .push(button(text(dev.name.as_str())).on_press(Message::CastSelect(i)).into());
-            }
-        } else {
-            toolbar_items.push(button("Cast to TV").on_press(Message::StartCastScan).into());
-        }
-        if let Some(err) = &state.cast_error {
-            toolbar_items.push(
-                text(err.as_str())
-                    .size(12)
-                    .color(Color::from_rgb(0.9, 0.2, 0.2))
-                    .into(),
-            );
-        }
-    }
-
-    // Photo count
-    if !state.image_paths.is_empty() {
-        let count_text = if state.loading {
-            format!(
-                "{} / {} photos",
-                state.thumbnails.len(),
-                state.image_paths.len()
+                false,
             )
         } else {
-            format!("{} photos", state.image_paths.len())
-        };
-        toolbar_items.push(text(count_text).size(13).color(LABEL_COLOR).into());
-    }
-
-    toolbar_items.push(Space::new().width(Length::Fill).into());
-
-    // Right side: URL + QR when sharing, otherwise folder path
-    if let (Some(url), Some(qr)) = (&state.server_url, &state.qr_handle) {
-        toolbar_items.push(text(url.as_str()).size(13).color(LABEL_COLOR).into());
-        toolbar_items.push(
-            image(qr.clone())
-                .width(28)
-                .height(28)
-                .into(),
-        );
-    } else {
-        toolbar_items.push(
-            text(match &state.folder {
-                Some(p) => p.display().to_string(),
-                None => "No folder selected".into(),
-            })
-            .size(14)
-            .into(),
-        );
-    }
-
-    let toolbar = row(toolbar_items).spacing(10).padding(10);
-
-    let content = if state.loading && state.thumbnails.is_empty() {
-        column![toolbar, container(text("Loading...")).center(Length::Fill),]
+            container(Space::new()).into()
+        }
+    } else if let Some(group_idx) = state.dup_compare {
+        if let Some(group) = state.dup_groups.get(group_idx) {
+            duplicates_compare_view(state, group)
+        } else {
+            container(Space::new()).into()
+        }
+    } else if state.dup_view_active {
+        duplicates_list_view(state)
+    } else if state.loading && state.thumbnails.is_empty() {
+        container(text("Loading...")).center(Length::Fill).into()
     } else if !state.loading && state.thumbnails.is_empty() {
-        column![
-            toolbar,
-            container(text("Open a folder to browse photos")).center(Length::Fill),
-        ]
+        container(text("Open a folder to browse photos"))
+            .center(Length::Fill)
+            .into()
     } else {
         let grid = thumbnail_grid(state);
-        column![
-            toolbar,
-            scrollable(grid)
-                .id(grid_scroll_id())
-                .on_scroll(|vp| Message::GridScrolled(vp.absolute_offset().y))
-                .height(Length::Fill),
-        ]
+        scrollable(grid)
+            .id(grid_scroll_id())
+            .on_scroll(|vp| Message::GridScrolled(vp.absolute_offset().y))
+            .height(Length::Fill)
+            .into()
     };
 
-    container(content).into()
+    // Wrap with menu overlay
+    let layers: Vec<Element<'_, Message>> = vec![content, menu_overlay(state)];
+    iced::widget::Stack::with_children(layers)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 const THUMB_SIZE: f32 = 200.0;
@@ -1670,14 +1579,6 @@ fn dup_badge_style(theme: &Theme) -> container::Style {
 }
 
 fn duplicates_list_view(state: &Looky) -> Element<'_, Message> {
-    let toolbar = row![
-        button("Back").on_press(Message::BackFromDuplicates),
-        Space::new().width(Length::Fill),
-        text(format!("{} duplicate groups found", state.dup_groups.len())).size(14),
-    ]
-    .spacing(10)
-    .padding(10);
-
     let cards: Vec<Element<'_, Message>> = state
         .dup_groups
         .iter()
@@ -1762,26 +1663,10 @@ fn duplicates_list_view(state: &Looky) -> Element<'_, Message> {
         .on_scroll(|vp| Message::DupListScrolled(vp.absolute_offset().y))
         .height(Length::Fill);
 
-    container(column![toolbar, list]).into()
+    container(list).into()
 }
 
 fn duplicates_compare_view<'a>(state: &'a Looky, group: &'a DuplicateGroup) -> Element<'a, Message> {
-    let (label, label_color) = match &group.match_kind {
-        MatchKind::Exact => ("Exact match", Color::from_rgb(0.9, 0.2, 0.2)),
-        MatchKind::Visual { distance } => {
-            let _ = distance;
-            ("Visual match", Color::from_rgb(0.9, 0.7, 0.1))
-        }
-    };
-
-    let toolbar = row![
-        button("Back").on_press(Message::BackFromCompare),
-        Space::new().width(Length::Fill),
-        text(label).size(14).color(label_color),
-    ]
-    .spacing(10)
-    .padding(10);
-
     let images: Vec<Element<'_, Message>> = group
         .indices
         .iter()
@@ -1851,7 +1736,7 @@ fn duplicates_compare_view<'a>(state: &'a Looky, group: &'a DuplicateGroup) -> E
         .height(Length::Fill)
         .width(Length::Fill);
 
-    container(column![toolbar, compare_row]).into()
+    container(compare_row).into()
 }
 
 fn viewer_scroll_id() -> iced::widget::Id {
@@ -1881,7 +1766,7 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
     };
 
     let vp_w = state.viewport_width;
-    let vp_h = state.viewport_height - 50.0;
+    let vp_h = state.viewport_height;
     let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
     let render_w = fit_w * state.viewer.zoom_level;
     let render_h = fit_h * state.viewer.zoom_level;
@@ -1892,7 +1777,7 @@ fn center_zoom_scroll(state: &Looky) -> Task<Message> {
         // Zoom toward cursor. Cursor is in window coords — convert to
         // viewport-relative coords (subtract toolbar).
         let rel_x = anchor_x;
-        let rel_y = anchor_y - 50.0;
+        let rel_y = anchor_y;
         // At zoom=1.0, the image was centered (same as non-zoomed view).
         // The cursor fraction within the image:
         let img_x = rel_x - pad_x;
@@ -1937,7 +1822,7 @@ fn anchor_zoom_scroll(state: &mut Looky, old_zoom: f32, new_zoom: f32) -> Task<M
     };
 
     let vp_w = state.viewport_width;
-    let vp_h = state.viewport_height - 50.0;
+    let vp_h = state.viewport_height;
     let (fit_w, fit_h) = fit_size(img_w, img_h, vp_w, vp_h);
 
     let old_render_w = fit_w * old_zoom;
@@ -1955,7 +1840,7 @@ fn anchor_zoom_scroll(state: &mut Looky, old_zoom: f32, new_zoom: f32) -> Task<M
     if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
         // Cursor position relative to the scrollable viewport
         let rel_x = anchor_x;
-        let rel_y = anchor_y - 50.0;
+        let rel_y = anchor_y;
 
         // Content position under cursor in the old layout (includes padding)
         let content_x = scroll_x + rel_x;
@@ -2029,16 +1914,12 @@ fn pan_zoom(state: &mut Looky, dx: f32, dy: f32) -> Task<Message> {
 }
 
 fn viewer_view<'a>(
-    path: &'a PathBuf,
     thumb_handle: Option<&'a image::Handle>,
     full_handle: Option<&'a image::Handle>,
-    index: usize,
-    total: usize,
     has_prev: bool,
     has_next: bool,
     meta: Option<&'a PhotoMetadata>,
     show_info: bool,
-    fullscreen: bool,
     zoom_level: f32,
     image_dims: Option<(u32, u32)>,
     viewport_width: f32,
@@ -2067,35 +1948,13 @@ fn viewer_view<'a>(
             .into();
     }
 
-    let filename = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let zoom_label = if zoom_level > 1.0 {
-        format!(" [{}%]", (zoom_level * 100.0) as u32)
-    } else {
-        String::new()
-    };
-    let info_label = if show_info { "Info \u{2190}" } else { "Info \u{2192}" };
-    let fs_label = if fullscreen { "Window" } else { "Fullscreen" };
-    let toolbar = row![
-        button("Back").on_press(Message::BackToGrid),
-        button(info_label).on_press(Message::ToggleInfo),
-        button(fs_label).on_press(Message::ToggleFullscreen),
-        Space::new().width(Length::Fill),
-        text(format!("{} ({}/{}){}", filename, index + 1, total, zoom_label)).size(14),
-    ]
-    .spacing(10)
-    .padding(10);
-
     if zoom_level > 1.0 {
         // Zoomed view: render at zoom_level × fit-to-screen size
         let handle = full_handle.or(thumb_handle);
         let image_layer: Element<'a, Message> = if let Some(h) = handle {
             let (img_w, img_h) = image_dims.unwrap_or((800, 600));
             let avail_w = viewport_width;
-            let avail_h = viewport_height - 50.0;
+            let avail_h = viewport_height;
             let (fit_w, fit_h) = fit_size(img_w, img_h, avail_w, avail_h);
             let render_w = fit_w * zoom_level;
             let render_h = fit_h * zoom_level;
@@ -2130,11 +1989,10 @@ fn viewer_view<'a>(
                 layers.push(info_panel(m));
             }
         }
-        let body = iced::widget::Stack::with_children(layers)
+        return iced::widget::Stack::with_children(layers)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        return column![toolbar, body].into();
+            .height(Length::Fill)
+            .into();
     }
 
     // Normal (fit-to-screen) view
@@ -2236,11 +2094,10 @@ fn viewer_view<'a>(
             layers.push(info_panel(m));
         }
     }
-    let body = iced::widget::Stack::with_children(layers)
+    iced::widget::Stack::with_children(layers)
         .width(Length::Fill)
-        .height(Length::Fill);
-
-    column![toolbar, body].into()
+        .height(Length::Fill)
+        .into()
 }
 
 const LABEL_COLOR: Color = Color::from_rgb(0.5, 0.5, 0.55);
@@ -2419,6 +2276,307 @@ fn info_panel_style(_theme: &Theme) -> container::Style {
         },
         ..Default::default()
     }
+}
+
+fn hamburger_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Color::from_rgba(0.25, 0.25, 0.25, 0.85),
+        _ => Color::from_rgba(0.15, 0.15, 0.15, 0.85),
+    };
+    button::Style {
+        background: Some(iced::Background::Color(bg)),
+        text_color: Color::WHITE,
+        border: iced::Border {
+            radius: 20.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn menu_container_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(Color::from_rgba(0.1, 0.1, 0.1, 0.85))),
+        border: iced::Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn menu_item_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => {
+            Some(iced::Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.1)))
+        }
+        _ => None,
+    };
+    button::Style {
+        background: bg,
+        text_color: Color::WHITE,
+        border: iced::Border::default(),
+        ..Default::default()
+    }
+}
+
+fn menu_item(label: &str, msg: Message) -> Element<'_, Message> {
+    button(text(label).width(Length::Fill))
+        .on_press(msg)
+        .style(menu_item_style)
+        .width(Length::Fill)
+        .into()
+}
+
+fn menu_info(content: impl Into<String>) -> Element<'static, Message> {
+    text(content.into())
+        .size(13)
+        .color(LABEL_COLOR)
+        .into()
+}
+
+fn menu_overlay(state: &Looky) -> Element<'_, Message> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+    // Hamburger button (always shown)
+    let hamburger = button(
+        container(text("☰").size(18).line_height(1.0))
+            .padding(iced::Padding { top: 3.0, right: 0.0, bottom: 0.0, left: 0.0 })
+            .center(Length::Fill),
+    )
+        .width(40)
+        .height(40)
+        .padding(0)
+        .on_press(Message::ToggleMenu)
+        .style(hamburger_button_style);
+    items.push(hamburger.into());
+
+    if state.menu_open {
+        let menu_items = build_menu_items(state);
+        let menu = container(column(menu_items).spacing(4).padding(8))
+            .style(menu_container_style)
+            .max_width(220);
+        items.push(menu.into());
+    }
+
+    container(column(items).spacing(4))
+        .padding(12)
+        .into()
+}
+
+fn build_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
+    if state.viewer.current_index.is_some() {
+        viewer_menu_items(state)
+    } else if state.dup_compare.is_some() {
+        compare_menu_items(state)
+    } else if state.dup_view_active {
+        dup_list_menu_items(state)
+    } else {
+        grid_menu_items(state)
+    }
+}
+
+fn grid_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+    // Open Folder
+    items.push(menu_item("Open Folder", Message::OpenFolder));
+    items.push(rule::horizontal(1).into());
+
+    // Find Duplicates / Scanning / Scan for new
+    if !state.image_paths.is_empty() {
+        if state.dup_scanning {
+            let scanned = state.dup_total - state.dup_pending.len();
+            items.push(menu_info(format!(
+                "Scanning {} / {}...",
+                scanned, state.dup_total
+            )));
+            items.push(menu_item("Cancel", Message::CancelDupScan));
+        } else {
+            items.push(menu_item("Find Duplicates", Message::FindDuplicates));
+        }
+    }
+
+    // Duplicates (N) button
+    if !state.dup_groups.is_empty() {
+        items.push(
+            button(
+                text(format!("Duplicates ({})", state.dup_groups.len())).width(Length::Fill),
+            )
+            .on_press(Message::ShowDuplicatesView)
+            .style(menu_item_style)
+            .width(Length::Fill)
+            .into(),
+        );
+    }
+
+    // Screensaver
+    if !state.image_paths.is_empty() {
+        let ss_label = if state.screensaver_active {
+            "Stop Screensaver"
+        } else {
+            "Screensaver"
+        };
+        items.push(menu_item(ss_label, Message::ToggleScreensaver));
+    }
+
+    items.push(rule::horizontal(1).into());
+
+    // Share
+    if !state.image_paths.is_empty() {
+        let share_label = if state.server_handle.is_some() {
+            "Stop Sharing"
+        } else {
+            "Share"
+        };
+        items.push(menu_item(share_label, Message::ToggleSharing));
+    }
+
+    // Cast controls (only when sharing)
+    if state.server_handle.is_some() {
+        if let Some(device) = &state.cast_device {
+            items.push(menu_info(format!("TV: {}", device.name)));
+            items.push(menu_item("Stop Cast", Message::StopCast));
+        } else if state.cast_scanning {
+            items.push(menu_info("Scanning...".to_string()));
+        } else if !state.cast_devices.is_empty() {
+            for (i, dev) in state.cast_devices.iter().enumerate() {
+                items.push(
+                    button(text(dev.name.as_str()).width(Length::Fill))
+                        .on_press(Message::CastSelect(i))
+                        .style(menu_item_style)
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+        } else {
+            items.push(menu_item("Cast to TV", Message::StartCastScan));
+        }
+        if let Some(err) = &state.cast_error {
+            items.push(
+                text(err.as_str())
+                    .size(12)
+                    .color(Color::from_rgb(0.9, 0.2, 0.2))
+                    .into(),
+            );
+        }
+    }
+
+    items.push(rule::horizontal(1).into());
+
+    // Photo count
+    if !state.image_paths.is_empty() {
+        let count_text = if state.loading {
+            format!(
+                "{} / {} photos",
+                state.thumbnails.len(),
+                state.image_paths.len()
+            )
+        } else {
+            format!("{} photos", state.image_paths.len())
+        };
+        items.push(menu_info(count_text));
+    }
+
+    // Folder path or server URL + QR
+    if let (Some(url), Some(qr)) = (&state.server_url, &state.qr_handle) {
+        items.push(
+            text(url.as_str())
+                .size(13)
+                .color(LABEL_COLOR)
+                .wrapping(text::Wrapping::WordOrGlyph)
+                .into(),
+        );
+        items.push(image(qr.clone()).width(80).height(80).into());
+    } else {
+        items.push(
+            text(match &state.folder {
+                Some(p) => p.display().to_string(),
+                None => "No folder selected".into(),
+            })
+            .size(13)
+            .color(LABEL_COLOR)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .into(),
+        );
+    }
+
+    items
+}
+
+fn viewer_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+    items.push(menu_item("Back", Message::BackToGrid));
+
+    let info_label = if state.viewer.show_info {
+        "Hide Info"
+    } else {
+        "Info"
+    };
+    items.push(menu_item(info_label, Message::ToggleInfo));
+
+    let fs_label = if state.fullscreen {
+        "Window"
+    } else {
+        "Fullscreen"
+    };
+    items.push(menu_item(fs_label, Message::ToggleFullscreen));
+
+    items.push(rule::horizontal(1).into());
+
+    // Filename
+    if let Some(index) = state.viewer.current_index {
+        if let Some(path) = state.image_paths.get(index) {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            items.push(menu_info(filename));
+            items.push(menu_info(format!(
+                "{} / {}",
+                index + 1,
+                state.image_paths.len()
+            )));
+            if state.viewer.zoom_level > 1.0 {
+                items.push(menu_info(format!(
+                    "Zoom: {}%",
+                    (state.viewer.zoom_level * 100.0) as u32
+                )));
+            }
+        }
+    }
+
+    items
+}
+
+fn dup_list_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    items.push(menu_item("Back", Message::BackFromDuplicates));
+    items.push(rule::horizontal(1).into());
+    items.push(menu_info(format!(
+        "{} duplicate groups found",
+        state.dup_groups.len()
+    )));
+    items
+}
+
+fn compare_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
+    let mut items: Vec<Element<'_, Message>> = Vec::new();
+    items.push(menu_item("Back", Message::BackFromCompare));
+    items.push(rule::horizontal(1).into());
+
+    if let Some(group_idx) = state.dup_compare {
+        if let Some(group) = state.dup_groups.get(group_idx) {
+            let (label, label_color) = match &group.match_kind {
+                MatchKind::Exact => ("Exact match", Color::from_rgb(0.9, 0.2, 0.2)),
+                MatchKind::Visual { .. } => ("Visual match", Color::from_rgb(0.9, 0.7, 0.1)),
+            };
+            items.push(text(label).size(13).color(label_color).into());
+        }
+    }
+
+    items
 }
 
 fn section_header(label: &str) -> Element<'_, Message> {
