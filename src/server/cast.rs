@@ -1,14 +1,9 @@
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rust_cast::channels::heartbeat::HeartbeatResponse;
 use rust_cast::channels::media::{Media, StreamType};
 use rust_cast::channels::receiver::CastDeviceApp;
-use rust_cast::{CastDevice, ChannelMessage};
+use rust_cast::CastDevice;
 
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -18,18 +13,6 @@ pub struct CastTarget {
     pub name: String,
     pub host: IpAddr,
     pub port: u16,
-}
-
-pub enum CastCommand {
-    LoadImage(String),
-    Stop,
-}
-
-pub struct CastHandle {
-    pub device_name: String,
-    command_tx: mpsc::Sender<CastCommand>,
-    shutdown: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
 }
 
 /// Discover Chromecast devices on the LAN (blocking, ~3 seconds).
@@ -83,152 +66,33 @@ pub fn discover_devices() -> Vec<CastTarget> {
     devices
 }
 
-impl CastHandle {
-    /// Connect to a Cast device and load the initial image (blocking).
-    pub fn connect(device: CastTarget, initial_url: String) -> Result<CastHandle, String> {
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown2 = Arc::clone(&shutdown);
-        let device_name = device.name.clone();
-
-        let thread = std::thread::Builder::new()
-            .name("looky-cast".into())
-            .spawn(move || cast_worker(device, initial_url, cmd_rx, shutdown2))
-            .map_err(|e| format!("Failed to spawn cast thread: {e}"))?;
-
-        Ok(CastHandle {
-            device_name,
-            command_tx: cmd_tx,
-            shutdown,
-            thread: Some(thread),
-        })
-    }
-
-    pub fn load_image(&self, url: String) {
-        let _ = self.command_tx.send(CastCommand::LoadImage(url));
-    }
-
-    pub fn stop(mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.command_tx.send(CastCommand::Stop);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-    }
-}
-
-impl Drop for CastHandle {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        let _ = self.command_tx.send(CastCommand::Stop);
-    }
-}
-
-fn cast_worker(
-    device: CastTarget,
-    initial_url: String,
-    cmd_rx: mpsc::Receiver<CastCommand>,
-    shutdown: Arc<AtomicBool>,
-) {
-    if let Err(e) = cast_worker_inner(&device, &initial_url, &cmd_rx, &shutdown) {
-        log::warn!("Cast session to '{}' ended: {e}", device.name);
-    }
-}
-
-fn cast_worker_inner(
-    device: &CastTarget,
-    initial_url: &str,
-    cmd_rx: &mpsc::Receiver<CastCommand>,
-    shutdown: &AtomicBool,
-) -> Result<(), String> {
+/// Cast a single image to a Chromecast device (blocking, ~2-4 seconds).
+///
+/// Opens a fresh connection, launches the Default Media Receiver, loads the
+/// image URL, then disconnects. The image stays on screen after disconnect.
+pub fn cast_image(device: &CastTarget, url: &str) -> Result<(), String> {
     let host = device.host.to_string();
     let cast = CastDevice::connect_without_host_verification(&host, device.port)
-        .map_err(|e| format!("TLS connect failed: {e}"))?;
+        .map_err(|e| format!("TLS connect: {e}"))?;
 
     cast.connection
         .connect("receiver-0")
-        .map_err(|e| format!("Receiver connect failed: {e}"))?;
+        .map_err(|e| format!("Receiver connect: {e}"))?;
 
     cast.heartbeat
         .ping()
-        .map_err(|e| format!("Initial ping failed: {e}"))?;
+        .map_err(|e| format!("Ping: {e}"))?;
 
+    // launch_app returns the existing app if already running
     let app = cast
         .receiver
         .launch_app(&CastDeviceApp::DefaultMediaReceiver)
-        .map_err(|e| format!("Launch app failed: {e}"))?;
+        .map_err(|e| format!("Launch app: {e}"))?;
 
     cast.connection
         .connect(&app.transport_id)
-        .map_err(|e| format!("App connect failed: {e}"))?;
+        .map_err(|e| format!("App connect: {e}"))?;
 
-    load_url(&cast, &app.transport_id, &app.session_id, initial_url)?;
-
-    log::info!("Casting to '{}' — initial image loaded", device.name);
-
-    // Main loop: handle heartbeat + commands
-    // receive() has no timeout, so we ping every ~1s and rely on receiving pongs
-    let mut last_ping = std::time::Instant::now();
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            let _ = cast.receiver.stop_app(&app.session_id);
-            return Ok(());
-        }
-
-        // Send ping if needed
-        if last_ping.elapsed() > Duration::from_secs(5) {
-            if let Err(e) = cast.heartbeat.ping() {
-                return Err(format!("Ping failed: {e}"));
-            }
-            last_ping = std::time::Instant::now();
-        }
-
-        // Check for commands (non-blocking)
-        match cmd_rx.try_recv() {
-            Ok(CastCommand::LoadImage(url)) => {
-                if let Err(e) = load_url(&cast, &app.transport_id, &app.session_id, &url) {
-                    log::warn!("Cast load failed: {e}");
-                }
-            }
-            Ok(CastCommand::Stop) => {
-                let _ = cast.receiver.stop_app(&app.session_id);
-                return Ok(());
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                let _ = cast.receiver.stop_app(&app.session_id);
-                return Ok(());
-            }
-        }
-
-        // Receive cast messages (non-blocking via short timeout)
-        match cast.receive() {
-            Ok(ChannelMessage::Heartbeat(HeartbeatResponse::Ping)) => {
-                let _ = cast.heartbeat.pong();
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let err = format!("{e}");
-                if err.contains("timed out") || err.contains("WouldBlock") {
-                    // Normal — no message ready
-                } else {
-                    return Err(format!("Receive error: {e}"));
-                }
-            }
-        }
-
-        // Small sleep to avoid busy-waiting
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn load_url(
-    cast: &CastDevice<'_>,
-    transport_id: &str,
-    session_id: &str,
-    url: &str,
-) -> Result<(), String> {
     let content_type = guess_content_type(url);
     let media = Media {
         content_id: url.to_string(),
@@ -239,10 +103,26 @@ fn load_url(
     };
 
     cast.media
-        .load(transport_id, session_id, &media)
-        .map_err(|e| format!("Media load failed: {e}"))?;
+        .load(&app.transport_id, &app.session_id, &media)
+        .map_err(|e| format!("Load: {e}"))?;
 
+    log::info!("Cast to '{}': {url}", device.name);
     Ok(())
+}
+
+/// Stop the Default Media Receiver on a Chromecast device.
+pub fn stop_casting(device: &CastTarget) {
+    let host = device.host.to_string();
+    let Ok(cast) = CastDevice::connect_without_host_verification(&host, device.port) else {
+        return;
+    };
+    let _ = cast.connection.connect("receiver-0");
+    let _ = cast.heartbeat.ping();
+    if let Ok(status) = cast.receiver.get_status() {
+        for app in &status.applications {
+            let _ = cast.receiver.stop_app(&app.session_id);
+        }
+    }
 }
 
 fn guess_content_type(url: &str) -> &'static str {

@@ -93,11 +93,10 @@ struct Looky {
     server_url: Option<String>,
     qr_handle: Option<image::Handle>,
     // Chromecast
-    cast_handle: Option<server::cast::CastHandle>,
+    cast_device: Option<server::cast::CastTarget>,
     cast_scanning: bool,
     cast_devices: Vec<server::cast::CastTarget>,
     cast_error: Option<String>,
-    cast_pending: Option<std::sync::mpsc::Receiver<Result<server::cast::CastHandle, String>>>,
 }
 
 impl Default for Looky {
@@ -140,11 +139,10 @@ impl Default for Looky {
             server_handle: None,
             server_url: None,
             qr_handle: None,
-            cast_handle: None,
+            cast_device: None,
             cast_scanning: false,
             cast_devices: Vec::new(),
             cast_error: None,
-            cast_pending: None,
         }
     }
 }
@@ -193,8 +191,8 @@ pub enum Message {
     // Chromecast
     StartCastScan,
     CastDevicesFound(Vec<server::cast::CastTarget>),
-    CastConnect(usize),
-    CastPollConnect,
+    CastSelect(usize),
+    CastImage,
     StopCast,
     // Navigation
     GridScrolled(f32),
@@ -231,11 +229,6 @@ fn subscription(state: &Looky) -> Subscription<Message> {
             iced::time::every(Duration::from_secs(10)).map(|_| Message::ScreensaverAdvance),
         );
     }
-    if state.cast_pending.is_some() {
-        subs.push(
-            iced::time::every(Duration::from_millis(200)).map(|_| Message::CastPollConnect),
-        );
-    }
     Subscription::batch(subs)
 }
 
@@ -254,7 +247,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::FolderSelected(Some(path)) => {
             save_last_folder(&path);
             // Stop casting and sharing on folder change
-            stop_cast(state);
+            state.cast_device = None;
+            state.cast_devices.clear();
+            state.cast_error = None;
             if let Some(handle) = state.server_handle.take() {
                 std::thread::spawn(move || handle.stop());
             }
@@ -389,21 +384,18 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.selected_thumb = Some(index);
             state.viewer.open_index(index);
             refresh_metadata(state);
-            cast_update_image(state);
             return preload_viewer_images(state);
         }
         Message::NextImage => {
             state.viewer.next(state.image_paths.len());
             state.selected_thumb = state.viewer.current_index;
             refresh_metadata(state);
-            cast_update_image(state);
             return preload_viewer_images(state);
         }
         Message::PrevImage => {
             state.viewer.prev();
             state.selected_thumb = state.viewer.current_index;
             refresh_metadata(state);
-            cast_update_image(state);
             return preload_viewer_images(state);
         }
         Message::BackToGrid => {
@@ -779,7 +771,6 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.viewer.open_index(idx);
             state.viewer.reset_zoom();
             refresh_metadata(state);
-            cast_update_image(state);
             let preload = preload_viewer_images(state);
             let preload_next = preload_next_screensaver_image(state);
             return Task::batch([preload, preload_next]);
@@ -898,7 +889,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ToggleSharing => {
             if state.server_handle.is_some() {
                 // Stop sharing — also stop casting
-                stop_cast(state);
+                state.cast_device = None;
+            state.cast_devices.clear();
+            state.cast_error = None;
                 if let Some(handle) = state.server_handle.take() {
                     std::thread::spawn(move || handle.stop());
                 }
@@ -935,76 +928,49 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.cast_scanning = false;
             state.cast_devices = devices;
         }
-        Message::CastConnect(i) => {
+        Message::CastSelect(i) => {
             if let Some(device) = state.cast_devices.get(i).cloned() {
-                let image_url = cast_current_image_url(state);
-                let (tx, rx) = std::sync::mpsc::channel();
-                state.cast_pending = Some(rx);
+                state.cast_device = Some(device);
+                state.cast_devices.clear();
                 state.cast_error = None;
-                std::thread::spawn(move || {
-                    let result = server::cast::CastHandle::connect(device, image_url);
-                    let _ = tx.send(result);
-                });
+                // Cast the current image immediately
+                cast_current_image(state);
             }
         }
-        Message::CastPollConnect => {
-            if let Some(rx) = &state.cast_pending {
-                match rx.try_recv() {
-                    Ok(Ok(handle)) => {
-                        state.cast_handle = Some(handle);
-                        state.cast_pending = None;
-                        state.cast_devices.clear();
-                    }
-                    Ok(Err(e)) => {
-                        state.cast_error = Some(e);
-                        state.cast_pending = None;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        state.cast_error = Some("Connection failed".into());
-                        state.cast_pending = None;
-                    }
-                }
-            }
+        Message::CastImage => {
+            cast_current_image(state);
         }
         Message::StopCast => {
-            stop_cast(state);
+            if let Some(device) = &state.cast_device {
+                let device = device.clone();
+                std::thread::spawn(move || server::cast::stop_casting(&device));
+            }
+            state.cast_device = None;
+            state.cast_devices.clear();
+            state.cast_error = None;
         }
     }
     Task::none()
 }
 
-fn stop_cast(state: &mut Looky) {
-    state.cast_devices.clear();
-    state.cast_pending = None;
-    state.cast_error = None;
-    if let Some(handle) = state.cast_handle.take() {
-        std::thread::spawn(move || handle.stop());
-    }
-}
-
-fn cast_current_image_url(state: &Looky) -> String {
-    if let (Some(url), Some(idx)) = (&state.server_url, state.viewer.current_index) {
-        let path = &state.image_paths[idx];
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        format!("{url}/image/{idx}/{filename}")
-    } else if let Some(url) = &state.server_url {
-        format!("{url}/image/0/photo")
-    } else {
-        String::new()
-    }
-}
-
-fn cast_update_image(state: &Looky) {
-    if let Some(handle) = &state.cast_handle {
-        let url = cast_current_image_url(state);
-        if !url.is_empty() {
-            handle.load_image(url);
+fn cast_current_image(state: &mut Looky) {
+    let (Some(device), Some(url), Some(idx)) =
+        (&state.cast_device, &state.server_url, state.viewer.current_index)
+    else {
+        return;
+    };
+    let path = &state.image_paths[idx];
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let image_url = format!("{url}/image/{idx}/{filename}");
+    let device = device.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = server::cast::cast_image(&device, &image_url) {
+            log::warn!("Cast failed: {e}");
         }
-    }
+    });
 }
 
 fn grid_scroll_id() -> iced::widget::Id {
@@ -1326,6 +1292,10 @@ fn view(state: &Looky) -> Element<'_, Message> {
                 if repeat { return None; }
                 Some(Message::ToggleFullscreen)
             }
+            Key::Character(c) if c.as_str() == "c" => {
+                if repeat { return None; }
+                Some(Message::CastImage)
+            }
             _ => None,
         }
     })
@@ -1471,20 +1441,20 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
 
     // Cast to TV (only when sharing is active)
     if state.server_handle.is_some() {
-        if let Some(handle) = &state.cast_handle {
+        if let Some(device) = &state.cast_device {
             toolbar_items.push(
-                text(format!("Casting to {}", handle.device_name))
+                text(format!("TV: {}", device.name))
                     .size(13)
                     .color(LABEL_COLOR)
                     .into(),
             );
             toolbar_items.push(button("Stop Cast").on_press(Message::StopCast).into());
-        } else if state.cast_scanning || state.cast_pending.is_some() {
+        } else if state.cast_scanning {
             toolbar_items.push(text("Scanning...").size(13).color(LABEL_COLOR).into());
         } else if !state.cast_devices.is_empty() {
             for (i, dev) in state.cast_devices.iter().enumerate() {
                 toolbar_items
-                    .push(button(text(dev.name.as_str())).on_press(Message::CastConnect(i)).into());
+                    .push(button(text(dev.name.as_str())).on_press(Message::CastSelect(i)).into());
             }
         } else {
             toolbar_items.push(button("Cast to TV").on_press(Message::StartCastScan).into());
