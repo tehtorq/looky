@@ -715,10 +715,6 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         // Screensaver
         Message::ToggleScreensaver => {
-            // If zoomed, treat as pan-down instead
-            if state.viewer.current_index.is_some() && state.viewer.is_zoomed() {
-                return pan_zoom(state, 0.0, 30.0);
-            }
             if state.screensaver_active {
                 // Stop screensaver
                 state.screensaver_active = false;
@@ -954,8 +950,9 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
 }
 
 fn cast_current_image(state: &mut Looky) {
+    let idx = state.viewer.current_index.or(state.selected_thumb);
     let (Some(device), Some(url), Some(idx)) =
-        (&state.cast_device, &state.server_url, state.viewer.current_index)
+        (&state.cast_device, &state.server_url, idx)
     else {
         return;
     };
@@ -1249,12 +1246,9 @@ fn view(state: &Looky) -> Element<'_, Message> {
     KeyListener::new(content, move |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
-        // During screensaver, only allow 's' (toggle off) and Escape
+        // During screensaver, only allow Escape to exit
         if screensaver {
             return match &key {
-                Key::Character(c) if c.as_str() == "s" && !repeat => {
-                    Some(Message::ToggleScreensaver)
-                }
                 Key::Named(Named::Escape) if !repeat => Some(Message::KeyEscape),
                 _ => None,
             };
@@ -1265,18 +1259,12 @@ fn view(state: &Looky) -> Element<'_, Message> {
             Key::Named(Named::ArrowRight) => Some(Message::KeyRight),
             Key::Named(Named::ArrowUp) => Some(Message::KeyUp),
             Key::Named(Named::ArrowDown) => Some(Message::KeyDown),
-            Key::Character(c) if c.as_str() == "s" => {
-                if repeat {
-                    Some(Message::KeyDown)
-                } else {
-                    Some(Message::ToggleScreensaver)
-                }
-            }
-            Key::Character(c) if matches!(c.as_str(), "a" | "w" | "d") => {
+            Key::Character(c) if matches!(c.as_str(), "a" | "w" | "d" | "s") => {
                 match c.as_str() {
                     "a" => Some(Message::KeyLeft),
                     "d" => Some(Message::KeyRight),
                     "w" => Some(Message::KeyUp),
+                    "s" => Some(Message::KeyDown),
                     _ => None,
                 }
             }
@@ -1427,6 +1415,16 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
                 .on_press(Message::ShowDuplicatesView)
                 .into(),
         );
+    }
+
+    // Screensaver button
+    if !state.image_paths.is_empty() {
+        let ss_label = if state.screensaver_active {
+            "Stop Screensaver"
+        } else {
+            "Screensaver"
+        };
+        toolbar_items.push(button(ss_label).on_press(Message::ToggleScreensaver).into());
     }
 
     // Share button

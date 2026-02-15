@@ -44,17 +44,23 @@ pub fn discover_devices() -> Vec<CastTarget> {
         };
         match receiver.recv_timeout(remaining) {
             Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                let name = info
+                let friendly = info
                     .get_property_val_str("fn")
-                    .unwrap_or_else(|| info.get_fullname())
-                    .to_string();
+                    .unwrap_or_else(|| info.get_fullname());
+                let name = match info.get_property_val_str("md") {
+                    Some(model) => format!("{friendly} ({model})"),
+                    None => friendly.to_string(),
+                };
 
                 if let Some(ip) = info.get_addresses_v4().into_iter().next() {
-                    devices.push(CastTarget {
-                        name,
-                        host: IpAddr::V4(ip),
-                        port: info.get_port(),
-                    });
+                    let addr = IpAddr::V4(ip);
+                    if !devices.iter().any(|d: &CastTarget| d.host == addr) {
+                        devices.push(CastTarget {
+                            name,
+                            host: addr,
+                            port: info.get_port(),
+                        });
+                    }
                 }
             }
             Ok(_) => {}
