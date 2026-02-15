@@ -1,3 +1,4 @@
+pub mod cast;
 pub mod dlna;
 pub mod http;
 pub mod ssdp;
