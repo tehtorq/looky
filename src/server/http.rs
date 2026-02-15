@@ -3,6 +3,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use image::GenericImageView;
+
 use super::dlna;
 use super::ServerState;
 use crate::thumbnail;
@@ -10,34 +12,51 @@ use crate::thumbnail;
 const THUMBS_PER_PAGE: usize = 60;
 const THUMB_MAX_SIZE: u32 = 400;
 const THUMB_QUALITY: u8 = 80;
-const DLNA_TRANSFER_MODE: &str = "transferMode.dlna.org: Streaming";
-const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+const DLNA_TRANSFER_INTERACTIVE: &str = "transferMode.dlna.org: Interactive";
+const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
 
 type HttpResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub fn run(server: tiny_http::Server, state: Arc<ServerState>) {
     let thumb_cache: Arc<Mutex<HashMap<usize, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let server = Arc::new(server);
 
-    loop {
-        if state.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        let request = match server.recv_timeout(Duration::from_secs(1)) {
-            Ok(Some(req)) => req,
-            Ok(None) => continue,
-            Err(_) => break,
-        };
+    let workers: Vec<_> = (0..4)
+        .map(|i| {
+            let server = Arc::clone(&server);
+            let state = Arc::clone(&state);
+            let cache = Arc::clone(&thumb_cache);
+            std::thread::Builder::new()
+                .name(format!("looky-http-{i}"))
+                .spawn(move || {
+                    loop {
+                        if state.shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let request = match server.recv_timeout(Duration::from_secs(1)) {
+                            Ok(Some(req)) => req,
+                            Ok(None) => continue,
+                            Err(_) => break,
+                        };
 
-        let url = request.url().to_string();
-        let method = request.method().to_string();
+                        let url = request.url().to_string();
+                        let method = request.method().to_string();
 
-        log::debug!("HTTP {} {}", method, url);
+                        log::debug!("HTTP {} {}", method, url);
 
-        let result = route(request, &method, &url, &state, &thumb_cache);
+                        let result = route(request, &method, &url, &state, &cache);
 
-        if let Err(e) = result {
-            log::debug!("HTTP response error: {}", e);
-        }
+                        if let Err(e) = result {
+                            log::debug!("HTTP response error: {}", e);
+                        }
+                    }
+                })
+                .unwrap()
+        })
+        .collect();
+
+    for w in workers {
+        let _ = w.join();
     }
 }
 
@@ -55,19 +74,19 @@ fn route(
             serve_gallery(request, state, page)
         }
         ("GET", path) if path.starts_with("/thumb/") => {
-            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            let index = parse_index_from_path(&path[7..]);
             serve_thumbnail(request, state, index, thumb_cache)
         }
         ("GET", path) if path.starts_with("/image/") => {
-            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            let index = parse_index_from_path(&path[7..]);
             serve_image(request, state, index)
         }
         ("HEAD", path) if path.starts_with("/thumb/") => {
-            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            let index = parse_index_from_path(&path[7..]);
             serve_image_head(request, state, index, true)
         }
         ("HEAD", path) if path.starts_with("/image/") => {
-            let index: usize = path[7..].parse().unwrap_or(usize::MAX);
+            let index = parse_index_from_path(&path[7..]);
             serve_image_head(request, state, index, false)
         }
         ("GET", "/dlna/device.xml") => serve_device_xml(request, state),
@@ -208,7 +227,7 @@ fn serve_thumbnail(
                         .parse::<tiny_http::Header>()
                         .unwrap(),
                 )
-                .with_header(DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap())
+                .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
                 .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
             request.respond(response)?;
             return Ok(());
@@ -236,7 +255,7 @@ fn serve_thumbnail(
                 .parse::<tiny_http::Header>()
                 .unwrap(),
         )
-        .with_header(DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap())
+        .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
         .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
     request.respond(response)?;
     Ok(())
@@ -244,32 +263,62 @@ fn serve_thumbnail(
 
 fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -> HttpResult {
     if index >= state.image_paths.len() {
+        log::debug!("Image request index {index} out of range (total {})", state.image_paths.len());
         return serve_404(request);
     }
 
     let path = &state.image_paths[index];
-    let file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    let mime = dlna::mime_for_path(path);
+    let orientation = crate::thumbnail::read_orientation(path);
 
-    let reader = std::io::BufReader::new(file);
-    let response = tiny_http::Response::new(
-        tiny_http::StatusCode(200),
-        vec![
-            format!("Content-Type: {mime}")
-                .parse::<tiny_http::Header>()
-                .unwrap(),
-            "Cache-Control: public, max-age=3600"
-                .parse::<tiny_http::Header>()
-                .unwrap(),
-            DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap(),
-            DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
-        ],
-        reader,
-        Some(len as usize),
-        None,
-    );
-    request.respond(response)?;
+    if orientation > 1 {
+        // Image needs rotation — decode, rotate, re-encode as JPEG
+        log::debug!("Serving image {index} with orientation correction ({orientation}): {}", path.display());
+        let img = image::open(path)?;
+        let rotated = match orientation {
+            2 => img.fliph(),
+            3 => img.rotate180(),
+            4 => img.flipv(),
+            5 => img.rotate90().fliph(),
+            6 => img.rotate90(),
+            7 => img.rotate270().fliph(),
+            8 => img.rotate270(),
+            _ => img,
+        };
+        let mut buf = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+        let (w, h) = rotated.dimensions();
+        use image::ImageEncoder;
+        encoder.write_image(rotated.to_rgb8().as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
+
+        let response = tiny_http::Response::from_data(buf)
+            .with_header("Content-Type: image/jpeg".parse::<tiny_http::Header>().unwrap())
+            .with_header("Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap())
+            .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
+            .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
+        request.respond(response)?;
+    } else {
+        // No rotation needed — stream original file
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let mime = dlna::mime_for_path(path);
+
+        log::debug!("Serving image {index}: path={} mime={mime} size={len}", path.display());
+
+        let reader = std::io::BufReader::new(file);
+        let response = tiny_http::Response::new(
+            tiny_http::StatusCode(200),
+            vec![
+                format!("Content-Type: {mime}").parse::<tiny_http::Header>().unwrap(),
+                "Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap(),
+                DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
+                DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
+            ],
+            reader,
+            Some(len as usize),
+            None,
+        );
+        request.respond(response)?;
+    }
     Ok(())
 }
 
@@ -299,7 +348,7 @@ fn serve_image_head(
             "Cache-Control: public, max-age=3600"
                 .parse::<tiny_http::Header>()
                 .unwrap(),
-            DLNA_TRANSFER_MODE.parse::<tiny_http::Header>().unwrap(),
+            DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
             DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
         ],
         std::io::empty(),
@@ -350,6 +399,13 @@ fn serve_404(request: tiny_http::Request) -> HttpResult {
     let response = tiny_http::Response::from_string("Not Found").with_status_code(404);
     request.respond(response)?;
     Ok(())
+}
+
+/// Parse index from path like "42", "42.jpg", or "42/filename.jpg".
+fn parse_index_from_path(s: &str) -> usize {
+    let first_segment = s.split('/').next().unwrap_or(s);
+    let num_part = first_segment.split('.').next().unwrap_or(first_segment);
+    num_part.parse().unwrap_or(usize::MAX)
 }
 
 fn html_escape(s: &str) -> String {

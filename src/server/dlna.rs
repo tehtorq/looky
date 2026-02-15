@@ -188,7 +188,7 @@ fn extract_soap_action(body: &str) -> Option<String> {
 }
 
 /// Max items per browse page when client sends RequestedCount=0 (meaning "all").
-const BROWSE_PAGE_SIZE: usize = 30;
+const BROWSE_PAGE_SIZE: usize = 200;
 
 fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf]) -> String {
     let object_id = extract_xml_value(body, "ObjectID").unwrap_or_else(|| "0".to_string());
@@ -222,7 +222,7 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
         // Individual item metadata
         if let Ok(idx) = object_id.parse::<usize>() {
             if let Some(path) = image_paths.get(idx) {
-                let item = build_didl_item(idx, path, addr);
+                let item = build_didl_item_full(idx, path, addr);
                 let didl = format!(
                     r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">{item}</DIDL-Lite>"#
                 );
@@ -264,18 +264,71 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
     )
 }
 
+/// Lightweight item for BrowseDirectChildren listings (no disk I/O for dimensions).
 fn build_didl_item(index: usize, path: &Path, addr: SocketAddr) -> String {
     let title = xml_escape(&file_title(path));
     let mime = mime_for_path(path);
-    let image_url = format!("http://{addr}/image/{index}");
-    let thumb_url = format!("http://{addr}/thumb/{index}");
+    let filename = url_filename(path);
+    let image_url = format!("http://{addr}/image/{index}/{filename}");
+    let thumb_url = format!("http://{addr}/thumb/{index}/thumb_{index}.jpg");
+    let dlna_pn = dlna_profile_for_mime(mime);
+    let dlna_features = format!(
+        "{dlna_pn}DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000"
+    );
+    let thumb_features = "DLNA.ORG_PN=JPEG_TN;DLNA.ORG_OP=01;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
+    format!(
+        r#"<item id="{index}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:{mime}:{dlna_features}">{image_url}</res><res protocolInfo="http-get:*:image/jpeg:{thumb_features}">{thumb_url}</res></item>"#
+    )
+}
+
+/// Full item with resolution and size for BrowseMetadata on a single item.
+fn build_didl_item_full(index: usize, path: &Path, addr: SocketAddr) -> String {
+    let title = xml_escape(&file_title(path));
+    let mime = mime_for_path(path);
+    let filename = url_filename(path);
+    let image_url = format!("http://{addr}/image/{index}/{filename}");
+    let thumb_url = format!("http://{addr}/thumb/{index}/thumb_{index}.jpg");
     let size_attr = std::fs::metadata(path)
         .map(|m| format!(r#" size="{}""#, m.len()))
         .unwrap_or_default();
-    let dlna_features = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+    let resolution_attr = image::image_dimensions(path)
+        .map(|(w, h)| format!(r#" resolution="{w}x{h}""#))
+        .unwrap_or_default();
+    let dlna_pn = dlna_profile_for_mime(mime);
+    let dlna_features = format!(
+        "{dlna_pn}DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000"
+    );
+    let thumb_features = "DLNA.ORG_PN=JPEG_TN;DLNA.ORG_OP=01;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
     format!(
-        r#"<item id="{index}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:{mime}:{dlna_features}"{size_attr}>{image_url}</res><upnp:albumArtURI>{thumb_url}</upnp:albumArtURI></item>"#
+        r#"<item id="{index}" parentID="0" restricted="1"><dc:title>{title}</dc:title><upnp:class>object.item.imageItem.photo</upnp:class><res protocolInfo="http-get:*:{mime}:{dlna_features}"{size_attr}{resolution_attr}>{image_url}</res><res protocolInfo="http-get:*:image/jpeg:{thumb_features}">{thumb_url}</res></item>"#
     )
+}
+
+fn url_filename(path: &Path) -> String {
+    let name = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "photo.jpg".to_string());
+    // Percent-encode characters that are not URL-safe
+    let mut encoded = String::with_capacity(name.len());
+    for b in name.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(b as char);
+            }
+            _ => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
+}
+
+fn dlna_profile_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "DLNA.ORG_PN=JPEG_LRG;",
+        "image/png" => "DLNA.ORG_PN=PNG_LRG;",
+        _ => "",
+    }
 }
 
 fn soap_response(action: &str, inner: &str) -> String {
