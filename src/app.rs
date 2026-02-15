@@ -93,7 +93,8 @@ struct Looky {
     server_url: Option<String>,
     qr_handle: Option<image::Handle>,
     // Chromecast
-    cast_device: Option<server::cast::CastTarget>,
+    cast_session: Option<server::cast::CastSession>,
+    cast_target_name: Option<String>,
     cast_scanning: bool,
     cast_devices: Vec<server::cast::CastTarget>,
     cast_error: Option<String>,
@@ -140,7 +141,8 @@ impl Default for Looky {
             server_handle: None,
             server_url: None,
             qr_handle: None,
-            cast_device: None,
+            cast_session: None,
+            cast_target_name: None,
             cast_scanning: false,
             cast_devices: Vec::new(),
             cast_error: None,
@@ -194,6 +196,7 @@ pub enum Message {
     StartCastScan,
     CastDevicesFound(Vec<server::cast::CastTarget>),
     CastSelect(usize),
+    CastConnected(server::cast::CastSession),
     CastImage,
     StopCast,
     // Navigation
@@ -267,7 +270,10 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::FolderSelected(Some(path)) => {
             save_last_folder(&path);
             // Stop casting and sharing on folder change
-            state.cast_device = None;
+            if let Some(session) = state.cast_session.take() {
+                session.stop();
+            }
+            state.cast_target_name = None;
             state.cast_devices.clear();
             state.cast_error = None;
             if let Some(handle) = state.server_handle.take() {
@@ -905,9 +911,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ToggleSharing => {
             if state.server_handle.is_some() {
                 // Stop sharing — also stop casting
-                state.cast_device = None;
-            state.cast_devices.clear();
-            state.cast_error = None;
+                if let Some(session) = state.cast_session.take() {
+                    session.stop();
+                }
+                state.cast_target_name = None;
+                state.cast_devices.clear();
+                state.cast_error = None;
                 if let Some(handle) = state.server_handle.take() {
                     std::thread::spawn(move || handle.stop());
                 }
@@ -945,23 +954,40 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             state.cast_devices = devices;
         }
         Message::CastSelect(i) => {
-            if let Some(device) = state.cast_devices.get(i).cloned() {
-                state.cast_device = Some(device);
+            if let Some(target) = state.cast_devices.get(i).cloned() {
                 state.cast_devices.clear();
                 state.cast_error = None;
-                // Cast the current image immediately
-                cast_current_image(state);
+                let image_url = cast_image_url(state);
+                return Task::perform(
+                    async move {
+                        let session = server::cast::CastSession::connect(target)?;
+                        if let Some(url) = image_url {
+                            let _ = session.load_image(&url);
+                        }
+                        Ok::<_, String>(session)
+                    },
+                    |result| match result {
+                        Ok(session) => Message::CastConnected(session),
+                        Err(e) => {
+                            log::warn!("Cast connect failed: {e}");
+                            Message::StopCast
+                        }
+                    },
+                );
             }
+        }
+        Message::CastConnected(session) => {
+            state.cast_target_name = Some(session.target.name.clone());
+            state.cast_session = Some(session);
         }
         Message::CastImage => {
             cast_current_image(state);
         }
         Message::StopCast => {
-            if let Some(device) = &state.cast_device {
-                let device = device.clone();
-                std::thread::spawn(move || server::cast::stop_casting(&device));
+            if let Some(session) = state.cast_session.take() {
+                session.stop();
             }
-            state.cast_device = None;
+            state.cast_target_name = None;
             state.cast_devices.clear();
             state.cast_error = None;
         }
@@ -972,25 +998,28 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
     Task::none()
 }
 
-fn cast_current_image(state: &mut Looky) {
-    let idx = state.viewer.current_index.or(state.selected_thumb);
-    let (Some(device), Some(url), Some(idx)) =
-        (&state.cast_device, &state.server_url, idx)
-    else {
-        return;
-    };
+/// Build the HTTP URL for the current image, if casting is possible.
+fn cast_image_url(state: &Looky) -> Option<String> {
+    let idx = state.viewer.current_index.or(state.selected_thumb)?;
+    let url = state.server_url.as_ref()?;
     let path = &state.image_paths[idx];
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let image_url = format!("{url}/image/{idx}/{filename}");
-    let device = device.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = server::cast::cast_image(&device, &image_url) {
-            log::warn!("Cast failed: {e}");
-        }
-    });
+    Some(format!("{url}/cast/{idx}/{filename}"))
+}
+
+fn cast_current_image(state: &Looky) {
+    let Some(session) = &state.cast_session else {
+        return;
+    };
+    let Some(image_url) = cast_image_url(state) else {
+        return;
+    };
+    if let Err(e) = session.load_image(&image_url) {
+        log::warn!("Cast send failed: {e}");
+    }
 }
 
 fn grid_scroll_id() -> iced::widget::Id {
@@ -2434,8 +2463,8 @@ fn grid_menu_items(state: &Looky) -> Vec<Element<'_, Message>> {
 
     // Cast controls (only when sharing)
     if state.server_handle.is_some() {
-        if let Some(device) = &state.cast_device {
-            items.push(menu_info(format!("TV: {}", device.name)));
+        if let Some(name) = &state.cast_target_name {
+            items.push(menu_info(format!("TV: {name}")));
             items.push(menu_item("Stop Cast", Message::StopCast));
         } else if state.cast_scanning {
             items.push(menu_info("Scanning...".to_string()));

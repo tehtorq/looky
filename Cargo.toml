@@ -19,7 +19,7 @@ image_hasher = "3"
 dirs-next = "2"
 rand = "0.9"
 tiny_http = "0.12"
-rust_cast = "0.21"
+rust_cast = { version = "0.21", features = ["thread_safe"] }
 mdns-sd = "0.17"
 qrcode = "0.14"
 uuid = { version = "1", features = ["v4"] }

@@ -12,6 +12,8 @@ use crate::thumbnail;
 const THUMBS_PER_PAGE: usize = 60;
 const THUMB_MAX_SIZE: u32 = 400;
 const THUMB_QUALITY: u8 = 80;
+const CAST_MAX_SIZE: u32 = 1920;
+const CAST_QUALITY: u8 = 90;
 const DLNA_TRANSFER_INTERACTIVE: &str = "transferMode.dlna.org: Interactive";
 const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
 
@@ -76,6 +78,10 @@ fn route(
         ("GET", path) if path.starts_with("/thumb/") => {
             let index = parse_index_from_path(&path[7..]);
             serve_thumbnail(request, state, index, thumb_cache)
+        }
+        ("GET", path) if path.starts_with("/cast/") => {
+            let index = parse_index_from_path(&path[6..]);
+            serve_cast_image(request, state, index)
         }
         ("GET", path) if path.starts_with("/image/") => {
             let index = parse_index_from_path(&path[7..]);
@@ -319,6 +325,20 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
         );
         request.respond(response)?;
     }
+    Ok(())
+}
+
+/// Serve a TV-sized (1920px) JPEG for Chromecast — much faster to transfer than full-res.
+fn serve_cast_image(request: tiny_http::Request, state: &ServerState, index: usize) -> HttpResult {
+    if index >= state.image_paths.len() {
+        return serve_404(request);
+    }
+    let path = &state.image_paths[index];
+    let jpeg_bytes = thumbnail::thumbnail_jpeg_bytes(path, CAST_MAX_SIZE, CAST_QUALITY);
+    let response = tiny_http::Response::from_data(jpeg_bytes)
+        .with_header("Content-Type: image/jpeg".parse::<tiny_http::Header>().unwrap())
+        .with_header("Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap());
+    request.respond(response)?;
     Ok(())
 }
 
