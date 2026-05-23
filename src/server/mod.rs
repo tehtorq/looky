@@ -42,10 +42,25 @@ impl Drop for ServerHandle {
 }
 
 /// Detect the local LAN IP by connecting a UDP socket to an external address.
+/// Tries a few public targets before giving up. The "connect" never actually
+/// sends a packet — the kernel just chooses the outgoing interface.
 fn local_ip() -> Option<std::net::IpAddr> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect("8.8.8.8:80").ok()?;
-    Some(sock.local_addr().ok()?.ip())
+    const PROBES: &[&str] = &["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:80"];
+    for probe in PROBES {
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if sock.connect(probe).is_err() {
+            continue;
+        }
+        if let Ok(addr) = sock.local_addr() {
+            let ip = addr.ip();
+            if !ip.is_unspecified() {
+                return Some(ip);
+            }
+        }
+    }
+    None
 }
 
 /// Start the HTTP + DLNA server. Returns the handle and the gallery URL.

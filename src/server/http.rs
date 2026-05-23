@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,6 +17,7 @@ const CAST_MAX_SIZE: u32 = 1920;
 const CAST_QUALITY: u8 = 90;
 const DLNA_TRANSFER_INTERACTIVE: &str = "transferMode.dlna.org: Interactive";
 const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
+const MAX_SOAP_BODY: u64 = 256 * 1024;
 
 type HttpResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -24,7 +26,7 @@ pub fn run(server: tiny_http::Server, state: Arc<ServerState>) {
     let server = Arc::new(server);
 
     let workers: Vec<_> = (0..4)
-        .map(|i| {
+        .filter_map(|i| {
             let server = Arc::clone(&server);
             let state = Arc::clone(&state);
             let cache = Arc::clone(&thumb_cache);
@@ -49,13 +51,18 @@ pub fn run(server: tiny_http::Server, state: Arc<ServerState>) {
                         let result = route(request, &method, &url, &state, &cache);
 
                         if let Err(e) = result {
-                            log::debug!("HTTP response error: {}", e);
+                            log::warn!("HTTP {} {} failed: {}", method, url, e);
                         }
                     }
                 })
-                .unwrap()
+                .map_err(|e| log::warn!("Failed to spawn HTTP worker {i}: {e}"))
+                .ok()
         })
         .collect();
+
+    if workers.is_empty() {
+        log::error!("No HTTP workers could be spawned; server is not serving requests");
+    }
 
     for w in workers {
         let _ = w.join();
@@ -75,26 +82,26 @@ fn route(
             let page: usize = path[6..].parse().unwrap_or(0);
             serve_gallery(request, state, page)
         }
-        ("GET", path) if path.starts_with("/thumb/") => {
-            let index = parse_index_from_path(&path[7..]);
-            serve_thumbnail(request, state, index, thumb_cache)
-        }
-        ("GET", path) if path.starts_with("/cast/") => {
-            let index = parse_index_from_path(&path[6..]);
-            serve_cast_image(request, state, index)
-        }
-        ("GET", path) if path.starts_with("/image/") => {
-            let index = parse_index_from_path(&path[7..]);
-            serve_image(request, state, index)
-        }
-        ("HEAD", path) if path.starts_with("/thumb/") => {
-            let index = parse_index_from_path(&path[7..]);
-            serve_image_head(request, state, index, true)
-        }
-        ("HEAD", path) if path.starts_with("/image/") => {
-            let index = parse_index_from_path(&path[7..]);
-            serve_image_head(request, state, index, false)
-        }
+        ("GET", path) if path.starts_with("/thumb/") => match parse_index_from_path(&path[7..]) {
+            Some(index) => serve_thumbnail(request, state, index, thumb_cache),
+            None => serve_404(request),
+        },
+        ("GET", path) if path.starts_with("/cast/") => match parse_index_from_path(&path[6..]) {
+            Some(index) => serve_cast_image(request, state, index),
+            None => serve_404(request),
+        },
+        ("GET", path) if path.starts_with("/image/") => match parse_index_from_path(&path[7..]) {
+            Some(index) => serve_image(request, state, index),
+            None => serve_404(request),
+        },
+        ("HEAD", path) if path.starts_with("/thumb/") => match parse_index_from_path(&path[7..]) {
+            Some(index) => serve_image_head(request, state, index, true),
+            None => serve_404(request),
+        },
+        ("HEAD", path) if path.starts_with("/image/") => match parse_index_from_path(&path[7..]) {
+            Some(index) => serve_image_head(request, state, index, false),
+            None => serve_404(request),
+        },
         ("GET", "/dlna/device.xml") => serve_device_xml(request, state),
         ("GET", "/dlna/content.xml") => serve_static_xml(request, dlna::content_directory_scpd()),
         ("GET", "/dlna/connection.xml") => {
@@ -269,7 +276,7 @@ fn serve_thumbnail(
 
 fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -> HttpResult {
     if index >= state.image_paths.len() {
-        log::debug!("Image request index {index} out of range (total {})", state.image_paths.len());
+        log::info!("Image request index {index} out of range (total {})", state.image_paths.len());
         return serve_404(request);
     }
 
@@ -389,17 +396,26 @@ fn serve_static_xml(request: tiny_http::Request, xml: &str) -> HttpResult {
 }
 
 fn serve_soap_content(mut request: tiny_http::Request, state: &ServerState) -> HttpResult {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
+    let body = read_bounded_body(&mut request)?;
     let xml = dlna::handle_content_directory(&body, state.server_addr, &state.image_paths);
     respond_xml(request, xml)
 }
 
 fn serve_soap_connection(mut request: tiny_http::Request) -> HttpResult {
-    let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
+    let body = read_bounded_body(&mut request)?;
     let xml = dlna::handle_connection_manager(&body);
     respond_xml(request, xml)
+}
+
+/// Read at most MAX_SOAP_BODY bytes. Prevents a misbehaving (or hostile) DLNA
+/// peer from forcing an unbounded allocation.
+fn read_bounded_body(request: &mut tiny_http::Request) -> std::io::Result<String> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .take(MAX_SOAP_BODY)
+        .read_to_string(&mut body)?;
+    Ok(body)
 }
 
 fn serve_subscribe(request: tiny_http::Request) -> HttpResult {
@@ -416,16 +432,17 @@ fn serve_subscribe(request: tiny_http::Request) -> HttpResult {
 }
 
 fn serve_404(request: tiny_http::Request) -> HttpResult {
+    log::info!("HTTP 404: {} {}", request.method(), request.url());
     let response = tiny_http::Response::from_string("Not Found").with_status_code(404);
     request.respond(response)?;
     Ok(())
 }
 
 /// Parse index from path like "42", "42.jpg", or "42/filename.jpg".
-fn parse_index_from_path(s: &str) -> usize {
+fn parse_index_from_path(s: &str) -> Option<usize> {
     let first_segment = s.split('/').next().unwrap_or(s);
     let num_part = first_segment.split('.').next().unwrap_or(first_segment);
-    num_part.parse().unwrap_or(usize::MAX)
+    num_part.parse().ok()
 }
 
 fn html_escape(s: &str) -> String {

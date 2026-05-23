@@ -122,18 +122,24 @@ pub fn find_duplicates(hashes: &[(usize, ImageHashes)], threshold: u32) -> Vec<D
         }
     }
 
+    // Track the minimum hamming distance ever seen within each cluster. When two
+    // clusters merge, the new root inherits the minimum of: the merged pair's
+    // distance, and any prior best from either side's previous root.
     let mut min_distance: HashMap<usize, u32> = HashMap::new();
 
     for (i, j, dist) in &matching_pairs {
         let ri = find(&mut parent, *i);
         let rj = find(&mut parent, *j);
+        let prev_ri = min_distance.remove(&ri);
+        let prev_rj = if ri == rj { None } else { min_distance.remove(&rj) };
         union(&mut parent, *i, *j);
         let root = find(&mut parent, *i);
-        let existing = min_distance.get(&root).copied().unwrap_or(u32::MAX);
-        let di = min_distance.get(&ri).copied().unwrap_or(u32::MAX);
-        let dj = min_distance.get(&rj).copied().unwrap_or(u32::MAX);
-        let best = dist.min(&existing).min(&di).min(&dj);
-        min_distance.insert(root, *best);
+        let best = [Some(*dist), prev_ri, prev_rj]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(*dist);
+        min_distance.insert(root, best);
     }
 
     // Collect clusters
