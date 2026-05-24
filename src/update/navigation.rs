@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use iced::Task;
+use rand::Rng;
 
-use crate::app::{Looky, Message};
+use crate::app::{Looky, Message, ScatteredCard};
 use crate::fs_scan;
 use crate::metadata;
 use crate::tasks;
@@ -10,6 +11,8 @@ use crate::ui::grid;
 use crate::ui::viewer_view;
 use crate::update::dup_update;
 use crate::viewer::ViewerState;
+
+const SCREENSAVER_MAX_CARDS: usize = 20;
 
 pub fn folder_selected(state: &mut Looky, path: PathBuf) -> Task<Message> {
     fs_scan::save_last_folder(&path);
@@ -137,6 +140,7 @@ pub fn arrow(state: &mut Looky, dx: i32, dy: i32) -> Task<Message> {
 pub fn toggle_screensaver(state: &mut Looky) -> Task<Message> {
     if state.screensaver_active {
         state.screensaver_active = false;
+        state.screensaver_cards.clear();
         state.viewer.close();
         state.cached_metadata = None;
         if !state.was_fullscreen {
@@ -156,23 +160,35 @@ pub fn toggle_screensaver(state: &mut Looky) -> Task<Message> {
     order.shuffle(&mut rand::rng());
     state.screensaver_order = order;
     state.screensaver_position = 0;
-    let idx = state.screensaver_order[0];
-    state.viewer.open_index(idx);
-    refresh_metadata(state);
-    let preload = tasks::preload_viewer_images(state);
-    let preload_next = tasks::preload_next_screensaver_image(state);
+    // Seed initial cards
+    state.screensaver_cards.clear();
+    let initial_count = SCREENSAVER_MAX_CARDS.min(state.thumbnails.len());
+    for _ in 0..initial_count {
+        add_screensaver_card(state);
+    }
     if !state.fullscreen {
         state.fullscreen = true;
-        let fs = iced::window::latest()
+        return iced::window::latest()
             .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Fullscreen));
-        return Task::batch([preload, preload_next, fs]);
     }
-    Task::batch([preload, preload_next])
+    Task::none()
 }
 
 pub fn screensaver_advance(state: &mut Looky) -> Task<Message> {
-    if !state.screensaver_active {
+    if !state.screensaver_active || state.thumbnails.is_empty() {
         return Task::none();
+    }
+    add_screensaver_card(state);
+    while state.screensaver_cards.len() > SCREENSAVER_MAX_CARDS {
+        state.screensaver_cards.remove(0);
+    }
+    Task::none()
+}
+
+fn add_screensaver_card(state: &mut Looky) {
+    let loaded = state.thumbnails.len();
+    if loaded == 0 {
+        return;
     }
     state.screensaver_position += 1;
     if state.screensaver_position >= state.screensaver_order.len() {
@@ -180,13 +196,59 @@ pub fn screensaver_advance(state: &mut Looky) -> Task<Message> {
         state.screensaver_order.shuffle(&mut rand::rng());
         state.screensaver_position = 0;
     }
-    let idx = state.screensaver_order[state.screensaver_position];
-    state.viewer.open_index(idx);
-    state.viewer.reset_zoom();
-    refresh_metadata(state);
-    let preload = tasks::preload_viewer_images(state);
-    let preload_next = tasks::preload_next_screensaver_image(state);
-    Task::batch([preload, preload_next])
+    let idx = state.screensaver_order[state.screensaver_position] % loaded;
+
+    let vw = state.viewport_width;
+    let vh = state.viewport_height;
+    let (x, y, size) = pick_placement(state, vw, vh);
+    state.screensaver_cards.push(ScatteredCard { idx, x, y, size });
+}
+
+/// Divide the screen into a grid of cells. Pick the cell whose most recent
+/// card is the oldest (or that has no card at all), then jitter within it.
+fn pick_placement(state: &Looky, vw: f32, vh: f32) -> (f32, f32, f32) {
+    let mut rng = rand::rng();
+
+    // Grid dimensions — enough cells to tile the screen at roughly card-size
+    let cols = 4_usize;
+    let rows = 3_usize;
+    let cell_w = vw / cols as f32;
+    let cell_h = vh / rows as f32;
+
+    // For each cell, find the index of the newest card that overlaps it.
+    // "Newest" = highest index in screensaver_cards (they're in insertion order).
+    let mut cell_freshness = vec![0_usize; cols * rows];
+    for (card_age, card) in state.screensaver_cards.iter().enumerate() {
+        let cx = ((card.x + card.size * 0.5) / cell_w).clamp(0.0, (cols - 1) as f32) as usize;
+        let cy = ((card.y + card.size * 0.5) / cell_h).clamp(0.0, (rows - 1) as f32) as usize;
+        let cell = cy * cols + cx;
+        cell_freshness[cell] = cell_freshness[cell].max(card_age + 1);
+    }
+
+    // Pick the stalest cell (lowest freshness = least recently updated)
+    let stalest_cell = cell_freshness
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, f)| **f)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let cell_col = (stalest_cell % cols) as f32;
+    let cell_row = (stalest_cell / cols) as f32;
+
+    // Size: larger than the cell so neighbors always overlap (no black gaps)
+    let base_size = cell_w.max(cell_h);
+    let size = rng.random_range((base_size * 1.0)..(base_size * 1.3));
+
+    // Position: center in cell with jitter
+    let center_x = (cell_col + 0.5) * cell_w;
+    let center_y = (cell_row + 0.5) * cell_h;
+    let jitter_x = rng.random_range(-(cell_w * 0.15)..(cell_w * 0.15));
+    let jitter_y = rng.random_range(-(cell_h * 0.15)..(cell_h * 0.15));
+    let x = center_x - size * 0.5 + jitter_x;
+    let y = center_y - size * 0.5 + jitter_y;
+
+    (x, y, size)
 }
 
 pub fn refresh_metadata(state: &mut Looky) {

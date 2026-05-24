@@ -18,6 +18,13 @@ use crate::ui::viewer_view;
 use crate::update::{dup_update, navigation as nav, sharing, zoom};
 use crate::viewer::ViewerState;
 
+pub(crate) struct ScatteredCard {
+    pub idx: usize,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+}
+
 fn boot() -> (Looky, Task<Message>) {
     let mut state = Looky::new();
 
@@ -82,6 +89,7 @@ pub(crate) struct Looky {
     pub(crate) screensaver_active: bool,
     pub(crate) screensaver_order: Vec<usize>,
     pub(crate) screensaver_position: usize,
+    pub(crate) screensaver_cards: Vec<ScatteredCard>,
     pub(crate) was_fullscreen: bool,
     pub(crate) server_handle: Option<server::ServerHandle>,
     pub(crate) server_url: Option<String>,
@@ -177,7 +185,7 @@ fn subscription(state: &Looky) -> Subscription<Message> {
         subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
     }
     if state.screensaver_active {
-        subs.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::ScreensaverAdvance));
+        subs.push(iced::time::every(Duration::from_secs(3)).map(|_| Message::ScreensaverAdvance));
     }
     Subscription::batch(subs)
 }

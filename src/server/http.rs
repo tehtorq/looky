@@ -15,6 +15,7 @@ const THUMB_MAX_SIZE: u32 = 400;
 const THUMB_QUALITY: u8 = 80;
 const CAST_MAX_SIZE: u32 = 1920;
 const CAST_QUALITY: u8 = 90;
+const DLNA_IMAGE_MAX: u32 = 3840;
 const DLNA_TRANSFER_INTERACTIVE: &str = "transferMode.dlna.org: Interactive";
 const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
 const MAX_SOAP_BODY: u64 = 256 * 1024;
@@ -283,10 +284,16 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
     let path = &state.image_paths[index];
     let orientation = crate::thumbnail::read_orientation(path);
 
-    if orientation > 1 {
-        // Image needs rotation — decode, rotate, re-encode as JPEG
-        log::debug!("Serving image {index} with orientation correction ({orientation}): {}", path.display());
-        let img = image::open(path)?;
+    let needs_transcode = orientation > 1 || crate::heic_decode::is_heic(path);
+
+    if needs_transcode {
+        log::debug!("Serving image {index} (transcode, orientation={orientation}): {}", path.display());
+        let img = image::open(path)
+            .ok()
+            .or_else(|| crate::heic_decode::open_heic(path));
+        let Some(img) = img else {
+            return serve_404(request);
+        };
         let rotated = match orientation {
             2 => img.fliph(),
             3 => img.rotate180(),
@@ -297,11 +304,12 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
             8 => img.rotate270(),
             _ => img,
         };
+        let resized = rotated.resize(DLNA_IMAGE_MAX, DLNA_IMAGE_MAX, image::imageops::FilterType::Lanczos3);
         let mut buf = Vec::new();
         let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
-        let (w, h) = rotated.dimensions();
+        let (w, h) = resized.dimensions();
         use image::ImageEncoder;
-        encoder.write_image(rotated.to_rgb8().as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
+        encoder.write_image(resized.to_rgb8().as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
 
         let response = tiny_http::Response::from_data(buf)
             .with_header("Content-Type: image/jpeg".parse::<tiny_http::Header>().unwrap())
@@ -310,7 +318,6 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
             .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
         request.respond(response)?;
     } else {
-        // No rotation needed — stream original file
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mime = dlna::mime_for_path(path);
@@ -360,24 +367,25 @@ fn serve_image_head(
     }
 
     let path = &state.image_paths[index];
-    let mime = if is_thumb { "image/jpeg" } else { dlna::mime_for_path(path) };
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mime = if is_thumb { "image/jpeg" } else { dlna::served_mime(path) };
+
+    let mut headers = vec![
+        format!("Content-Type: {mime}").parse::<tiny_http::Header>().unwrap(),
+        "Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap(),
+        DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
+        DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
+    ];
+    // Only report Content-Length for files served as-is (no transcode)
+    let needs_transcode = !is_thumb
+        && (crate::thumbnail::read_orientation(path) > 1 || crate::heic_decode::is_heic(path));
+    if !needs_transcode {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        headers.push(format!("Content-Length: {len}").parse::<tiny_http::Header>().unwrap());
+    }
 
     let response = tiny_http::Response::new(
         tiny_http::StatusCode(200),
-        vec![
-            format!("Content-Type: {mime}")
-                .parse::<tiny_http::Header>()
-                .unwrap(),
-            format!("Content-Length: {len}")
-                .parse::<tiny_http::Header>()
-                .unwrap(),
-            "Cache-Control: public, max-age=3600"
-                .parse::<tiny_http::Header>()
-                .unwrap(),
-            DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
-            DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
-        ],
+        headers,
         std::io::empty(),
         Some(0),
         None,

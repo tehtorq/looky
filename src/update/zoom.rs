@@ -33,11 +33,16 @@ pub fn zoom_adjust(state: &mut Looky, delta: f32, cursor_x: f32, cursor_y: f32) 
     }
     state.viewer.zoom_anchor = Some((cursor_x, cursor_y));
     let old_zoom = state.viewer.zoom_level;
-    state.viewer.adjust_zoom(delta);
-    state.viewer.zoom_level = state.viewer.zoom_target;
-    let new_zoom = state.viewer.zoom_level;
-    if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
+    let factor = 2.0_f32.powf(delta * 0.2);
+    let new_zoom = (old_zoom * factor).clamp(1.0, 8.0);
+    let new_zoom = if new_zoom < 1.02 { 1.0 } else { new_zoom };
+    state.viewer.zoom_level = new_zoom;
+    state.viewer.zoom_target = new_zoom;
+    if new_zoom > 1.0 && (new_zoom - old_zoom).abs() > 0.001 {
         return viewer_view::anchor_zoom_scroll(state, old_zoom, new_zoom);
+    }
+    if new_zoom <= 1.0 && old_zoom > 1.0 {
+        state.viewer.zoom_offset = (0.0, 0.0);
     }
     Task::none()
 }
@@ -60,21 +65,8 @@ pub fn click_zoom(state: &mut Looky, cx: f32, cy: f32) -> Task<Message> {
     Task::none()
 }
 
-pub fn click_unzoom(state: &mut Looky, cx: f32, cy: f32) -> Task<Message> {
-    let Some(idx) = state.viewer.current_index else {
-        return Task::none();
-    };
-    if !state.viewer_cache.contains_key(&idx) {
-        return Task::none();
-    }
-    state.viewer.zoom_anchor = Some((cx, cy));
-    let old_zoom = state.viewer.zoom_level;
-    state.viewer.adjust_zoom(-4.0);
-    let _ = state.viewer.tick_zoom();
-    let new_zoom = state.viewer.zoom_level;
-    if state.viewer.is_zoomed() && (new_zoom - old_zoom).abs() > 0.001 {
-        return viewer_view::anchor_zoom_scroll(state, old_zoom, new_zoom);
-    }
+pub fn click_unzoom(state: &mut Looky, _cx: f32, _cy: f32) -> Task<Message> {
+    state.viewer.reset_zoom();
     Task::none()
 }
 

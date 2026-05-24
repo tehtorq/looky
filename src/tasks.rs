@@ -137,38 +137,9 @@ pub fn preload_viewer_neighbors(state: &mut Looky) -> Task<Message> {
     Task::batch(tasks)
 }
 
-pub fn preload_next_screensaver_image(state: &mut Looky) -> Task<Message> {
-    if !state.screensaver_active {
-        return Task::none();
-    }
-    let next_pos = state.screensaver_position + 1;
-    if next_pos >= state.screensaver_order.len() {
-        return Task::none();
-    }
-    let next_idx = state.screensaver_order[next_pos];
-    if state.viewer_cache.contains_key(&next_idx) {
-        return Task::none();
-    }
-    let path = state.image_paths[next_idx].clone();
-    let (task, handle) = Task::perform(
-        async move {
-            match open_image_oriented(&path) {
-                Some(rgba) => {
-                    let (w, h) = rgba.dimensions();
-                    Message::ViewerImageLoaded(next_idx, rgba.into_raw(), w, h)
-                }
-                None => Message::Tick,
-            }
-        },
-        |msg| msg,
-    )
-    .abortable();
-    state.viewer_preload_handles.push((next_idx, handle));
-    task
-}
 
 fn open_image_oriented(path: &std::path::Path) -> Option<::image::RgbaImage> {
-    let img = ::image::open(path).ok()?;
+    let img = ::image::open(path).ok().or_else(|| crate::heic_decode::open_heic(path))?;
     let orientation = thumbnail::read_orientation(path);
     let oriented = match orientation {
         2 => img.fliph(),

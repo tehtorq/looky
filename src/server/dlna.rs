@@ -188,7 +188,7 @@ fn extract_soap_action(body: &str) -> Option<String> {
 }
 
 /// Max items per browse page when client sends RequestedCount=0 (meaning "all").
-const BROWSE_PAGE_SIZE: usize = 200;
+const BROWSE_PAGE_SIZE: usize = 24;
 
 fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf]) -> String {
     let object_id = extract_xml_value(body, "ObjectID").unwrap_or_else(|| "0".to_string());
@@ -242,7 +242,7 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
     }
 
     // BrowseDirectChildren of root
-    let count = if requested_count == 0 || requested_count > BROWSE_PAGE_SIZE { BROWSE_PAGE_SIZE } else { requested_count };
+    let count = if requested_count == 0 { BROWSE_PAGE_SIZE } else { requested_count.min(BROWSE_PAGE_SIZE) };
     let end = (starting_index + count).min(total);
     let slice = starting_index..end;
     let number_returned = slice.len();
@@ -267,7 +267,7 @@ fn handle_browse(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf
 /// Lightweight item for BrowseDirectChildren listings (no disk I/O for dimensions).
 fn build_didl_item(index: usize, path: &Path, addr: SocketAddr) -> String {
     let title = xml_escape(&file_title(path));
-    let mime = mime_for_path(path);
+    let mime = served_mime(path);
     let filename = url_filename(path);
     let image_url = format!("http://{addr}/image/{index}/{filename}");
     let thumb_url = format!("http://{addr}/thumb/{index}/thumb_{index}.jpg");
@@ -284,7 +284,7 @@ fn build_didl_item(index: usize, path: &Path, addr: SocketAddr) -> String {
 /// Full item with resolution and size for BrowseMetadata on a single item.
 fn build_didl_item_full(index: usize, path: &Path, addr: SocketAddr) -> String {
     let title = xml_escape(&file_title(path));
-    let mime = mime_for_path(path);
+    let mime = served_mime(path);
     let filename = url_filename(path);
     let image_url = format!("http://{addr}/image/{index}/{filename}");
     let thumb_url = format!("http://{addr}/thumb/{index}/thumb_{index}.jpg");
@@ -361,6 +361,15 @@ fn file_title(path: &Path) -> String {
         .unwrap_or_else(|| "Photo".to_string())
 }
 
+/// The MIME type the server will actually deliver. HEIC and images needing
+/// rotation are transcoded to JPEG, so the served type differs from the file.
+pub fn served_mime(path: &Path) -> &'static str {
+    if crate::heic_decode::is_heic(path) || crate::thumbnail::read_orientation(path) > 1 {
+        return "image/jpeg";
+    }
+    mime_for_path(path)
+}
+
 pub fn mime_for_path(path: &Path) -> &'static str {
     match path
         .extension()
@@ -374,6 +383,7 @@ pub fn mime_for_path(path: &Path) -> &'static str {
         Some("bmp") => "image/bmp",
         Some("webp") => "image/webp",
         Some("tiff" | "tif") => "image/tiff",
+        Some("heic" | "heif") => "image/heic",
         _ => "application/octet-stream",
     }
 }

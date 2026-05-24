@@ -31,7 +31,7 @@ fn is_image_file(path: &Path) -> bool {
     match path.extension().and_then(|e| e.to_str()) {
         Some(ext) => matches!(
             ext.to_lowercase().as_str(),
-            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "tif"
+            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "heic" | "heif"
         ),
         None => false,
     }

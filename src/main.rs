@@ -2,6 +2,7 @@ mod app;
 mod catalog;
 mod duplicates;
 mod fs_scan;
+mod heic_decode;
 mod key_listener;
 mod metadata;
 mod server;

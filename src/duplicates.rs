@@ -30,8 +30,9 @@ pub fn compute_hashes(path: &Path) -> Option<ImageHashes> {
     // SHA-256 content hash
     let content_hash: [u8; 32] = Sha256::digest(&file_bytes).into();
 
-    // Perceptual hash (dHash 8x8 gradient)
-    let img = image::load_from_memory(&file_bytes).ok()?;
+    let img = image::load_from_memory(&file_bytes)
+        .ok()
+        .or_else(|| crate::heic_decode::open_heic(path))?;
     let hasher = HasherConfig::new()
         .hash_alg(HashAlg::Gradient)
         .hash_size(8, 8)

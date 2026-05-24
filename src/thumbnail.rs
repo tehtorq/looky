@@ -40,7 +40,8 @@ pub fn generate_thumbnail(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
 }
 
 fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
-    let (orientation, exif_thumb) = read_exif_info(path);
+    let (raw_orientation, exif_thumb) = read_exif_info(path);
+    let orientation = if crate::heic_decode::is_heic(path) { 1 } else { raw_orientation };
 
     // Try embedded EXIF thumbnail first (fast — avoids full decode).
     // Only use it if it's large enough to avoid blurry upscaling.
@@ -71,16 +72,19 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
         return (thumb.to_rgba8().into_raw(), w, h);
     }
 
-    // Fallback: full decode + resize
-    match image::open(path) {
-        Ok(img) => {
+    // Fallback: full decode + resize (try image crate, then HEIC decoder)
+    let img = image::open(path)
+        .ok()
+        .or_else(|| crate::heic_decode::open_heic(path));
+    match img {
+        Some(img) => {
             let thumb = img.resize(max_size, max_size, FilterType::Triangle);
             let thumb = apply_orientation(thumb, orientation);
             let (w, h) = thumb.dimensions();
             (thumb.to_rgba8().into_raw(), w, h)
         }
-        Err(e) => {
-            log::warn!("Failed to load image {}: {}", path.display(), e);
+        None => {
+            log::warn!("Failed to load image {}", path.display());
             placeholder_thumbnail(max_size)
         }
     }
@@ -184,7 +188,13 @@ fn save_to_cache(key: &str, rgba: &[u8], width: u32, height: u32) {
 // --- EXIF ---
 
 /// Read just the EXIF orientation value.
+/// Returns 1 (identity) for HEIC/HEIF — the heic crate applies container
+/// transforms (irot/imir) during decode so EXIF orientation must not be
+/// reapplied.
 pub fn read_orientation(path: &Path) -> u32 {
+    if crate::heic_decode::is_heic(path) {
+        return 1;
+    }
     read_exif_info(path).0
 }
 

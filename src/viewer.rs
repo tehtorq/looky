@@ -83,12 +83,6 @@ impl ViewerState {
     pub fn adjust_zoom(&mut self, delta: f32) {
         let factor = 2.0_f32.powf(delta * 0.15);
         self.zoom_target = (self.zoom_target * factor).clamp(1.0, 8.0);
-        // Don't let target race too far ahead of current level — prevents
-        // large jumps when scroll events accumulate before animation starts.
-        self.zoom_target = self
-            .zoom_target
-            .clamp(self.zoom_level / 1.5, self.zoom_level * 1.5);
-        self.zoom_target = self.zoom_target.clamp(1.0, 8.0);
         if self.zoom_target < 1.02 {
             self.zoom_target = 1.0;
         }
@@ -114,20 +108,19 @@ impl ViewerState {
         let dt_ms = self
             .last_zoom_tick
             .map(|last| now.duration_since(last).as_secs_f32() * 1000.0)
-            .unwrap_or(16.0);
+            .unwrap_or(0.0);
         self.last_zoom_tick = Some(now);
 
-        // Skip if called again within the same millisecond (batched messages)
-        if dt_ms < 1.0 {
-            return false;
-        }
+        // First tick of a new animation (stale timestamp or first ever): use
+        // exactly one frame worth of interpolation, not a huge catch-up.
+        let dt_ms = if dt_ms > 50.0 || dt_ms < 1.0 { 16.0 } else { dt_ms };
 
         let was_zoomed = self.is_zoomed();
-        // Time-based exponential easing: 0.75 decay per 16ms frame.
-        // At 60fps (dt=16ms): same as old 25% step.
-        // After GPU stall (dt=500ms): catches up correctly in one call.
-        let frames = (dt_ms / 16.0).min(4.0); // cap at 4 frames to avoid snap
-        let decay = 0.75_f32.powf(frames);
+        // Time-based exponential easing: 0.8 decay per 16ms frame (20% per
+        // frame toward target). Reaches 90% in ~11 frames (~180ms) — smooth
+        // and visible as continuous motion.
+        let frames = dt_ms / 16.0;
+        let decay = 0.8_f32.powf(frames);
         self.zoom_level = self.zoom_target - (self.zoom_target - self.zoom_level) * decay;
         // Snap when very close
         if (self.zoom_level - self.zoom_target).abs() < 0.005 {
