@@ -1,9 +1,9 @@
 use iced::Task;
 
 use crate::app::{Looky, Message};
-use crate::metadata;
 use crate::tasks;
 use crate::ui::viewer_view;
+use crate::update::navigation;
 
 pub fn toggle_zoom(state: &mut Looky) -> Task<Message> {
     if let Some(idx) = state.viewer.current_index {
@@ -17,8 +17,10 @@ pub fn toggle_zoom(state: &mut Looky) -> Task<Message> {
             && idx < state.thumbnails.len()
         {
             state.viewer.open_index(idx);
-            refresh_metadata(state);
-            return tasks::preload_viewer_images(state);
+            return Task::batch([
+                navigation::refresh_metadata(state),
+                tasks::preload_viewer_images(state),
+            ]);
         }
     }
     Task::none()
@@ -90,16 +92,4 @@ pub fn pinch_zoom(state: &mut Looky, scale: f32, cx: f32, cy: f32) -> Task<Messa
         state.viewer.zoom_offset = (0.0, 0.0);
     }
     Task::none()
-}
-
-fn refresh_metadata(state: &mut Looky) {
-    if let Some(index) = state.viewer.current_index {
-        if state.cached_metadata.as_ref().is_some_and(|(i, _)| *i == index) {
-            return;
-        }
-        if let Some(path) = state.image_paths.get(index) {
-            let meta = metadata::read_metadata(path);
-            state.cached_metadata = Some((index, meta));
-        }
-    }
 }

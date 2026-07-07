@@ -65,8 +65,10 @@ fn visible_index_range(state: &Looky) -> std::ops::Range<usize> {
     let cols = state.grid_columns.max(1);
     let first_row = (state.grid_scroll_y / THUMB_CELL).floor().max(0.0) as usize;
     let visible_rows = (state.viewport_height / THUMB_CELL).ceil() as usize + 1;
-    let first_idx = first_row * cols;
+    // Clamp both ends: a stale scroll offset combined with a fresh column
+    // count can otherwise produce first > last and panic the slice.
     let last_idx = ((first_row + visible_rows) * cols).min(state.thumbnails.len());
+    let first_idx = (first_row * cols).min(last_idx);
     first_idx..last_idx
 }
 

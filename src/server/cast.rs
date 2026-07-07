@@ -2,9 +2,10 @@ use std::net::IpAddr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rust_cast::channels::heartbeat::HeartbeatResponse;
 use rust_cast::channels::media::{Media, StreamType};
 use rust_cast::channels::receiver::CastDeviceApp;
-use rust_cast::CastDevice;
+use rust_cast::{CastDevice, ChannelMessage};
 
 const CAST_SERVICE: &str = "_googlecast._tcp.local.";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -113,10 +114,10 @@ fn load_media(
     session_id: &str,
     url: &str,
 ) -> Result<(), String> {
-    let content_type = guess_content_type(url);
+    // The /cast/ endpoint always serves JPEG regardless of the source format.
     let media = Media {
         content_id: url.to_string(),
-        content_type: content_type.to_string(),
+        content_type: "image/jpeg".to_string(),
         stream_type: StreamType::Buffered,
         duration: None,
         metadata: None,
@@ -168,6 +169,28 @@ fn load_or_reconnect(
     }
 }
 
+/// Receive protocol messages until the device answers our ping with PONG,
+/// replying PONG to any device PINGs along the way. Bounded so a chatty
+/// device can't stall the worker. Returns false if the connection errored.
+fn pump_messages(device: &CastDevice<'static>) -> bool {
+    for _ in 0..32 {
+        match device.receive() {
+            Ok(ChannelMessage::Heartbeat(HeartbeatResponse::Ping)) => {
+                if device.heartbeat.pong().is_err() {
+                    return false;
+                }
+            }
+            Ok(ChannelMessage::Heartbeat(HeartbeatResponse::Pong)) => return true,
+            Ok(_) => {}
+            Err(e) => {
+                log::debug!("Cast receive failed: {e}");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn cast_worker(
     mut device: CastDevice<'static>,
     mut transport_id: String,
@@ -196,11 +219,12 @@ fn cast_worker(
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic ping — keeps our side of the TCP connection alive
-                // and may detect a dead connection early.
+                // Periodic ping, then drain incoming protocol messages while
+                // waiting for the answering PONG. This is where we reply to
+                // the device's own PINGs — without that it drops us as idle.
                 if last_ping.elapsed() >= HEARTBEAT_INTERVAL {
-                    if device.heartbeat.ping().is_err() {
-                        log::debug!("Cast heartbeat ping failed, proactive reconnect");
+                    if device.heartbeat.ping().is_err() || !pump_messages(&device) {
+                        log::debug!("Cast heartbeat failed, proactive reconnect");
                         match connect_device(&target) {
                             Ok((d, tid, sid)) => {
                                 device = d;
@@ -281,17 +305,4 @@ pub fn discover_devices() -> Vec<CastTarget> {
 
     let _ = mdns.shutdown();
     devices
-}
-
-fn guess_content_type(url: &str) -> &'static str {
-    let lower = url.to_lowercase();
-    if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".gif") {
-        "image/gif"
-    } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "image/jpeg"
-    }
 }

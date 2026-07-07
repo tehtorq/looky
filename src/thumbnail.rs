@@ -1,4 +1,4 @@
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 
 use image::imageops::FilterType;
@@ -15,15 +15,19 @@ pub fn generate_thumbnail(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
         if let Some(cache_path) = cache_file_path(key) {
             if let Ok(data) = std::fs::read(&cache_path) {
                 if let Ok((header, pixels)) = qoi::decode_to_vec(&data) {
+                    touch(&cache_path);
                     return (pixels, header.width, header.height);
                 }
             }
         }
-        // Fallback: try legacy JPEG cache
+        // Fallback: legacy JPEG cache — migrate to QOI and delete the old entry
         if let Some(legacy_path) = cache_file_path_legacy(key) {
             if let Ok(img) = image::open(&legacy_path) {
                 let (w, h) = img.dimensions();
-                return (img.to_rgba8().into_raw(), w, h);
+                let rgba = img.to_rgba8().into_raw();
+                save_to_cache(key, &rgba, w, h);
+                let _ = std::fs::remove_file(&legacy_path);
+                return (rgba, w, h);
             }
         }
     }
@@ -40,8 +44,11 @@ pub fn generate_thumbnail(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
 }
 
 fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32) {
+    // The embedded EXIF thumbnail and DCT-scaled JPEG paths hand back raw
+    // pixels, so the raw EXIF orientation applies — even for HEIC, whose
+    // embedded thumbnail is stored unrotated. Only open_heic applies the
+    // container transforms itself (see read_orientation).
     let (raw_orientation, exif_thumb) = read_exif_info(path);
-    let orientation = if crate::heic_decode::is_heic(path) { 1 } else { raw_orientation };
 
     // Try embedded EXIF thumbnail first (fast — avoids full decode).
     // Only use it if it's large enough to avoid blurry upscaling.
@@ -57,7 +64,7 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
         if large_enough {
             if let Ok(img) = image::load_from_memory(&data) {
                 let thumb = img.resize(max_size, max_size, FilterType::Triangle);
-                let thumb = apply_orientation(thumb, orientation);
+                let thumb = apply_orientation(thumb, raw_orientation);
                 let (w, h) = thumb.dimensions();
                 return (thumb.to_rgba8().into_raw(), w, h);
             }
@@ -67,17 +74,18 @@ fn generate_thumbnail_uncached(path: &Path, max_size: u32) -> (Vec<u8>, u32, u32
     // Try downscaled JPEG decode (avoids processing millions of unnecessary pixels)
     if let Some(img) = decode_jpeg_scaled(path, max_size) {
         let thumb = img.resize(max_size, max_size, FilterType::Triangle);
-        let thumb = apply_orientation(thumb, orientation);
+        let thumb = apply_orientation(thumb, raw_orientation);
         let (w, h) = thumb.dimensions();
         return (thumb.to_rgba8().into_raw(), w, h);
     }
 
     // Fallback: full decode + resize (try image crate, then HEIC decoder)
-    let img = image::open(path)
-        .ok()
-        .or_else(|| crate::heic_decode::open_heic(path));
-    match img {
-        Some(img) => {
+    let decoded = match image::open(path) {
+        Ok(img) => Some((img, raw_orientation)),
+        Err(_) => crate::heic_decode::open_heic(path).map(|img| (img, 1)),
+    };
+    match decoded {
+        Some((img, orientation)) => {
             let thumb = img.resize(max_size, max_size, FilterType::Triangle);
             let thumb = apply_orientation(thumb, orientation);
             let (w, h) = thumb.dimensions();
@@ -172,6 +180,42 @@ fn cache_file_path_legacy(key: &str) -> Option<PathBuf> {
     Some(dir.join(format!("{}.jpg", key)))
 }
 
+/// Bump a cache file's mtime so the age-based prune treats it as in use.
+fn touch(path: &Path) {
+    if let Ok(file) = std::fs::File::options().append(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// Delete cache entries not touched within `max_age`. Cache keys include the
+/// source file's mtime, so edited/re-synced photos strand their old entries
+/// forever without this. Called from a background thread at startup.
+pub fn prune_cache(max_age: std::time::Duration) {
+    let Some(root) = cache_dir() else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let Ok(subdirs) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for subdir in subdirs.flatten() {
+        let Ok(entries) = std::fs::read_dir(subdir.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age > max_age);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn save_to_cache(key: &str, rgba: &[u8], width: u32, height: u32) {
     let Some(path) = cache_file_path(key) else {
         return;
@@ -214,10 +258,12 @@ fn read_exif_info(path: &Path) -> (u32, Option<Vec<u8>>) {
         .unwrap_or(1);
 
     let thumbnail = (|| {
+        // JPEGInterchangeFormat offsets are relative to the TIFF header, i.e.
+        // the EXIF buffer kamadak-exif already holds — not the file start.
         let offset = exif
             .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
             .value
-            .get_uint(0)? as u64;
+            .get_uint(0)? as usize;
         let length = exif
             .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
             .value
@@ -225,17 +271,15 @@ fn read_exif_info(path: &Path) -> (u32, Option<Vec<u8>>) {
         if length == 0 || length > 1_000_000 {
             return None;
         }
-        reader.seek(SeekFrom::Start(offset)).ok()?;
-        let mut data = vec![0u8; length];
-        reader.read_exact(&mut data).ok()?;
-        Some(data)
+        let data = exif.buf().get(offset..offset.checked_add(length)?)?;
+        Some(data.to_vec())
     })();
 
     (orientation, thumbnail)
 }
 
 /// Apply EXIF orientation transform to an image.
-fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
+pub fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
     match orientation {
         2 => img.fliph(),
         3 => img.rotate180(),
@@ -250,7 +294,12 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
 
 
 fn placeholder_thumbnail(size: u32) -> (Vec<u8>, u32, u32) {
-    let pixels = vec![60u8; (size * size * 4) as usize];
+    let pixels: Vec<u8> = [60, 60, 60, 255]
+        .iter()
+        .copied()
+        .cycle()
+        .take((size * size * 4) as usize)
+        .collect();
     (pixels, size, size)
 }
 
@@ -305,3 +354,4 @@ pub fn generate_thumbnails_parallel(
         })
         .collect()
 }
+

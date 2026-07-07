@@ -1,5 +1,6 @@
 use std::path::Path;
 
+#[derive(Debug, Clone)]
 pub struct PhotoMetadata {
     pub filename: String,
     pub file_size: u64,

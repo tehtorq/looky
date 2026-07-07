@@ -8,14 +8,19 @@ pub async fn pick_folder() -> Option<PathBuf> {
         .map(|handle| handle.path().to_path_buf())
 }
 
-pub async fn scan_folder(folder: PathBuf) -> Vec<PathBuf> {
+pub fn scan_folder(folder: PathBuf) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut stack = vec![folder];
     while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
+                // file_type() doesn't follow symlinks — skipping symlinked
+                // dirs prevents infinite loops on cyclic links.
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 let path = entry.path();
-                if path.is_dir() {
+                if file_type.is_dir() {
                     stack.push(path);
                 } else if is_image_file(&path) {
                     paths.push(path);

@@ -6,7 +6,7 @@ use iced::widget::image;
 use iced::{Subscription, Task, Theme};
 
 use crate::catalog::Catalog;
-use crate::duplicates::{DuplicateGroup, ImageHashes};
+use crate::duplicates::{DuplicateGroup, HashResult, ImageHashes};
 use crate::fs_scan;
 use crate::metadata::{self, PhotoMetadata};
 use crate::server;
@@ -36,10 +36,16 @@ fn boot() -> (Looky, Task<Message>) {
         }
     }
 
+    std::thread::spawn(|| crate::thumbnail::prune_cache(std::time::Duration::from_secs(90 * 24 * 3600)));
+
     if let Some(folder) = fs_scan::load_last_folder() {
         state.folder = Some(folder.clone());
         state.loading = true;
-        let task = Task::perform(fs_scan::scan_folder(folder), Message::ImagesFound);
+        let generation = state.scan_generation;
+        let task = Task::perform(
+            tasks::run_blocking(move || fs_scan::scan_folder(folder)),
+            move |paths| Message::ImagesFound(generation, paths),
+        );
         return (state, task);
     }
     (state, Task::none())
@@ -56,9 +62,15 @@ pub fn run() -> iced::Result {
 
 #[derive(Default)]
 pub(crate) struct Looky {
+    /// Bumped on every folder change; async results tagged with an older
+    /// generation are dropped instead of corrupting the new folder's state.
+    pub(crate) scan_generation: u64,
+    /// Same idea for duplicate-scan lifecycle (also bumped on cancel/restart).
+    pub(crate) dup_generation: u64,
     pub(crate) folder: Option<PathBuf>,
     pub(crate) image_paths: Vec<PathBuf>,
     pub(crate) thumbnails: Vec<(PathBuf, image::Handle, Instant)>,
+    pub(crate) last_thumb_added: Option<Instant>,
     pub(crate) pending_thumbnails: Vec<PathBuf>,
     pub(crate) thumbnail_index: HashMap<PathBuf, usize>,
     pub(crate) pending_upgrades: Vec<PathBuf>,
@@ -69,6 +81,9 @@ pub(crate) struct Looky {
     pub(crate) catalog: Option<Catalog>,
     pub(crate) dup_hashes: Vec<(usize, ImageHashes)>,
     pub(crate) dup_pending: Vec<(usize, PathBuf)>,
+    /// Paths whose hashing failed this session — skipped on rescans so a
+    /// corrupt file isn't fully re-read and re-decoded on every scan.
+    pub(crate) dup_failed: HashSet<PathBuf>,
     pub(crate) dup_scanning: bool,
     pub(crate) dup_total: usize,
     pub(crate) dup_groups: Vec<DuplicateGroup>,
@@ -117,22 +132,24 @@ impl Looky {
 pub enum Message {
     OpenFolder,
     FolderSelected(Option<PathBuf>),
-    ImagesFound(Vec<PathBuf>),
-    ThumbnailBatchReady(Vec<(PathBuf, Vec<u8>, u32, u32)>),
-    PreviewBatchReady(Vec<(PathBuf, Option<(Vec<u8>, u32, u32)>)>),
-    ThumbnailUpgradeReady(Vec<(PathBuf, Vec<u8>, u32, u32)>),
+    ImagesFound(u64, Vec<PathBuf>),
+    PreviewBatchReady(u64, Vec<(PathBuf, Option<(Vec<u8>, u32, u32)>)>),
+    ThumbnailUpgradeReady(u64, Vec<(PathBuf, Vec<u8>, u32, u32)>),
     ViewImage(usize),
     NextImage,
     PrevImage,
     BackToGrid,
     ToggleInfo,
-    ViewerImageLoaded(usize, Vec<u8>, u32, u32),
+    ViewerImageLoaded(u64, usize, Vec<u8>, u32, u32),
+    ViewerImageFailed(usize),
+    MetadataLoaded(usize, Box<metadata::PhotoMetadata>),
     Tick,
     FindDuplicates,
     CancelDupScan,
-    DupHashBatchReady(Vec<(usize, Option<ImageHashes>)>),
-    DupAnalysisReady(Vec<DuplicateGroup>, HashMap<usize, metadata::FileSummary>),
-    CachedDupAnalysisReady(Vec<DuplicateGroup>, HashMap<usize, metadata::FileSummary>),
+    DupScanPrepared(u64, Vec<(usize, ImageHashes)>, Vec<(usize, PathBuf)>),
+    DupHashBatchReady(u64, Vec<(usize, Option<HashResult>)>),
+    DupAnalysisReady(u64, Vec<DuplicateGroup>, HashMap<usize, metadata::FileSummary>),
+    CachedDupAnalysisReady(u64, Vec<DuplicateGroup>, HashMap<usize, metadata::FileSummary>),
     ShowDuplicatesView,
     BackFromDuplicates,
     CompareDuplicates(usize),
@@ -154,6 +171,7 @@ pub enum Message {
     CastDevicesFound(Vec<server::cast::CastTarget>),
     CastSelect(usize),
     CastConnected(server::cast::CastSession),
+    CastFailed(String),
     CastImage,
     StopCast,
     GridScrolled(f32),
@@ -191,8 +209,10 @@ fn subscription(state: &Looky) -> Subscription<Message> {
 }
 
 fn thumbnails_fading(state: &Looky) -> bool {
-    state.thumbnails.last()
-        .is_some_and(|(_, _, added)| added.elapsed().as_secs_f32() * 1000.0 < grid::THUMB_FADE_MS)
+    // Upgrades refresh timestamps at arbitrary (visible-first) indices, so
+    // track the most recent insertion rather than checking only the last slot.
+    state.last_thumb_added
+        .is_some_and(|added| added.elapsed().as_secs_f32() * 1000.0 < grid::THUMB_FADE_MS)
 }
 
 fn update(state: &mut Looky, message: Message) -> Task<Message> {
@@ -209,15 +229,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::OpenFolder => return Task::perform(fs_scan::pick_folder(), Message::FolderSelected),
         Message::FolderSelected(Some(path)) => return nav::folder_selected(state, path),
         Message::FolderSelected(None) => {}
-        Message::ImagesFound(paths) => return nav::images_found(state, paths),
-        Message::ThumbnailBatchReady(results) => {
-            let now = Instant::now();
-            for (path, rgba, w, h) in results {
-                state.thumbnails.push((path, image::Handle::from_rgba(w, h, rgba), now));
+        Message::ImagesFound(generation, paths) => {
+            if generation != state.scan_generation {
+                return Task::none();
             }
-            return tasks::load_next_batch(state);
+            return nav::images_found(state, paths);
         }
-        Message::PreviewBatchReady(results) => {
+        Message::PreviewBatchReady(generation, results) => {
+            if generation != state.scan_generation {
+                return Task::none();
+            }
             let now = Instant::now();
             for (path, preview) in results {
                 let idx = state.thumbnails.len();
@@ -229,20 +250,25 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
                 state.thumbnails.push((path.clone(), handle, now));
                 state.pending_upgrades.push(path);
             }
+            state.last_thumb_added = Some(now);
             return Task::batch([
                 tasks::load_next_preview_batch(state),
                 tasks::load_upgrade_batches(state),
             ]);
         }
-        Message::ThumbnailUpgradeReady(results) => {
+        Message::ThumbnailUpgradeReady(generation, results) => {
+            if generation != state.scan_generation {
+                return Task::none();
+            }
             state.upgrade_batches_in_flight = state.upgrade_batches_in_flight.saturating_sub(1);
             let now = Instant::now();
             for (path, rgba, w, h) in results {
                 let handle = image::Handle::from_rgba(w, h, rgba);
-                if let Some(&idx) = state.thumbnail_index.get(&path) {
-                    if idx < state.thumbnails.len() {
-                        state.thumbnails[idx] = (path, handle, now);
-                    }
+                if let Some(&idx) = state.thumbnail_index.get(&path)
+                    && idx < state.thumbnails.len()
+                {
+                    state.thumbnails[idx] = (path, handle, now);
+                    state.last_thumb_added = Some(now);
                 }
             }
             if state.pending_upgrades.is_empty()
@@ -254,20 +280,26 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ViewImage(index) => {
             state.selected_thumb = Some(index);
             state.viewer.open_index(index);
-            nav::refresh_metadata(state);
-            return tasks::preload_viewer_images(state);
+            return Task::batch([
+                nav::refresh_metadata(state),
+                tasks::preload_viewer_images(state),
+            ]);
         }
         Message::NextImage => {
             state.viewer.next(state.image_paths.len());
             state.selected_thumb = state.viewer.current_index;
-            nav::refresh_metadata(state);
-            return tasks::preload_viewer_images(state);
+            return Task::batch([
+                nav::refresh_metadata(state),
+                tasks::preload_viewer_images(state),
+            ]);
         }
         Message::PrevImage => {
             state.viewer.prev();
             state.selected_thumb = state.viewer.current_index;
-            nav::refresh_metadata(state);
-            return tasks::preload_viewer_images(state);
+            return Task::batch([
+                nav::refresh_metadata(state),
+                tasks::preload_viewer_images(state),
+            ]);
         }
         Message::BackToGrid => {
             state.viewer.close();
@@ -277,7 +309,20 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
             return grid::restore_grid_scroll(state);
         }
         Message::ToggleInfo => state.viewer.toggle_info(),
-        Message::ViewerImageLoaded(i, rgba, w, h) => return nav::viewer_image_loaded(state, i, rgba, w, h),
+        Message::ViewerImageLoaded(generation, i, rgba, w, h) => {
+            if generation != state.scan_generation {
+                return Task::none();
+            }
+            return nav::viewer_image_loaded(state, i, rgba, w, h);
+        }
+        Message::ViewerImageFailed(i) => {
+            log::warn!("viewer: [{}] failed to decode", i);
+        }
+        Message::MetadataLoaded(i, meta) => {
+            if state.viewer.current_index == Some(i) {
+                state.cached_metadata = Some((i, *meta));
+            }
+        }
         Message::Tick => {
             state.viewer.tick();
             let old = state.viewer.zoom_level;
@@ -290,9 +335,12 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         }
         Message::FindDuplicates => return dup_update::find_duplicates(state),
         Message::CancelDupScan => dup_update::cancel_dup_scan(state),
-        Message::DupHashBatchReady(r) => return dup_update::dup_hash_batch_ready(state, r),
-        Message::DupAnalysisReady(g, s) => dup_update::dup_analysis_ready(state, g, s),
-        Message::CachedDupAnalysisReady(g, s) => dup_update::cached_dup_analysis_ready(state, g, s),
+        Message::DupScanPrepared(generation, hashes, pending) => {
+            return dup_update::dup_scan_prepared(state, generation, hashes, pending);
+        }
+        Message::DupHashBatchReady(generation, r) => return dup_update::dup_hash_batch_ready(state, generation, r),
+        Message::DupAnalysisReady(generation, g, s) => dup_update::dup_analysis_ready(state, generation, g, s),
+        Message::CachedDupAnalysisReady(generation, g, s) => dup_update::cached_dup_analysis_ready(state, generation, g, s),
         Message::ShowDuplicatesView => { state.dup_view_active = true; state.dup_compare = None; state.dup_scroll_y = 0.0; }
         Message::BackFromDuplicates => state.dup_view_active = false,
         Message::CompareDuplicates(i) => state.dup_compare = Some(i),
@@ -304,6 +352,11 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::ViewerDrag(dx, dy) if state.viewer.is_zoomed() => return viewer_view::pan_zoom(state, -dx, -dy),
         Message::ViewerDrag(_, _) => {}
         Message::DragScroll(_dx, dy) => {
+            // The compare view sits on top of the duplicates list — don't
+            // scroll the hidden list underneath it.
+            if state.dup_compare.is_some() {
+                return Task::none();
+            }
             let (id, scroll_y) = if state.dup_view_active {
                 (duplicates_view::dup_list_scroll_id(), &mut state.dup_scroll_y)
             } else {
@@ -331,15 +384,16 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::KeyUp => return nav::arrow(state, 0, -1),
         Message::KeyDown => return nav::arrow(state, 0, 1),
         Message::KeyEnter => {
-            if let Some(idx) = state.selected_thumb {
-                if state.viewer.current_index.is_none()
-                    && !state.dup_view_active && state.dup_compare.is_none()
-                    && idx < state.thumbnails.len()
-                {
-                    state.viewer.open_index(idx);
-                    nav::refresh_metadata(state);
-                    return tasks::preload_viewer_images(state);
-                }
+            if let Some(idx) = state.selected_thumb
+                && state.viewer.current_index.is_none()
+                && !state.dup_view_active && state.dup_compare.is_none()
+                && idx < state.thumbnails.len()
+            {
+                state.viewer.open_index(idx);
+                return Task::batch([
+                    nav::refresh_metadata(state),
+                    tasks::preload_viewer_images(state),
+                ]);
             }
         }
         Message::ToggleFullscreen => {
@@ -351,7 +405,20 @@ fn update(state: &mut Looky, message: Message) -> Task<Message> {
         Message::StartCastScan => return sharing::start_cast_scan(state),
         Message::CastDevicesFound(d) => { state.cast_scanning = false; state.cast_devices = d; }
         Message::CastSelect(i) => return sharing::cast_select(state, i),
-        Message::CastConnected(s) => { state.cast_target_name = Some(s.target.name.clone()); state.cast_session = Some(s); }
+        Message::CastConnected(s) => {
+            // Sharing may have been toggled off while the connect was in
+            // flight — don't resurrect a session with no server behind it.
+            if state.server_handle.is_none() {
+                s.stop();
+                return Task::none();
+            }
+            state.cast_target_name = Some(s.target.name.clone());
+            state.cast_session = Some(s);
+        }
+        Message::CastFailed(e) => {
+            state.cast_scanning = false;
+            state.cast_error = Some(e);
+        }
         Message::CastImage => sharing::cast_current_image(state),
         Message::StopCast => sharing::stop_cast(state),
         Message::ToggleMenu => state.menu_open = !state.menu_open,

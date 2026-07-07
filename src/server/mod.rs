@@ -38,6 +38,7 @@ impl ServerHandle {
 impl Drop for ServerHandle {
     fn drop(&mut self) {
         self.state.shutdown.store(true, Ordering::Relaxed);
+        ssdp::send_byebye_now(&self.state);
     }
 }
 
@@ -91,10 +92,18 @@ pub fn start_server(
         .ok()?;
 
     let ssdp_state = Arc::clone(&state);
-    let ssdp_thread = std::thread::Builder::new()
+    let ssdp_thread = match std::thread::Builder::new()
         .name("looky-ssdp".into())
         .spawn(move || ssdp::run(ssdp_state))
-        .ok()?;
+    {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("Failed to spawn SSDP thread: {e}");
+            state.shutdown.store(true, Ordering::Relaxed);
+            let _ = http_thread.join();
+            return None;
+        }
+    };
 
     Some((
         ServerHandle {

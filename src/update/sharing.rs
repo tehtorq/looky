@@ -2,6 +2,7 @@ use iced::Task;
 
 use crate::app::{Looky, Message};
 use crate::server;
+use crate::tasks;
 use crate::ui::qr;
 
 pub fn toggle_sharing(state: &mut Looky) {
@@ -24,12 +25,15 @@ pub fn toggle_sharing(state: &mut Looky) {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Photos".to_string());
-        if let Some((handle, url)) =
-            server::start_server(state.image_paths.clone(), folder_name)
-        {
-            state.qr_handle = Some(qr::render_qr(&url));
-            state.server_url = Some(url);
-            state.server_handle = Some(handle);
+        match server::start_server(state.image_paths.clone(), folder_name) {
+            Some((handle, url)) => {
+                state.qr_handle = Some(qr::render_qr(&url));
+                state.server_url = Some(url);
+                state.server_handle = Some(handle);
+            }
+            None => {
+                state.cast_error = Some("Couldn't start sharing (no network?)".to_string());
+            }
         }
     }
 }
@@ -39,7 +43,7 @@ pub fn start_cast_scan(state: &mut Looky) -> Task<Message> {
     state.cast_devices.clear();
     state.cast_error = None;
     Task::perform(
-        async { server::cast::discover_devices() },
+        tasks::run_blocking(server::cast::discover_devices),
         Message::CastDevicesFound,
     )
 }
@@ -52,18 +56,18 @@ pub fn cast_select(state: &mut Looky, i: usize) -> Task<Message> {
     state.cast_error = None;
     let image_url = cast_image_url(state);
     Task::perform(
-        async move {
+        tasks::run_blocking(move || {
             let session = server::cast::CastSession::connect(target)?;
             if let Some(url) = image_url {
                 let _ = session.load_image(&url);
             }
             Ok::<_, String>(session)
-        },
+        }),
         |result| match result {
             Ok(session) => Message::CastConnected(session),
             Err(e) => {
                 log::warn!("Cast connect failed: {e}");
-                Message::StopCast
+                Message::CastFailed(e)
             }
         },
     )
@@ -93,10 +97,10 @@ pub fn cast_current_image(state: &Looky) {
 fn cast_image_url(state: &Looky) -> Option<String> {
     let idx = state.viewer.current_index.or(state.selected_thumb)?;
     let url = state.server_url.as_ref()?;
-    let path = &state.image_paths[idx];
-    let filename = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    Some(format!("{url}/cast/{idx}/{filename}"))
+    // No filename segment: raw filenames need percent-encoding the receiver
+    // can trip on, and /cast/ always serves JPEG regardless of extension.
+    if idx >= state.image_paths.len() {
+        return None;
+    }
+    Some(format!("{url}/cast/{idx}"))
 }

@@ -9,11 +9,29 @@ const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const NOTIFY_INTERVAL: Duration = Duration::from_secs(60);
 
+fn bind_ssdp_socket() -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT).into())?;
+    Ok(socket.into())
+}
+
+fn multicast_iface(state: &ServerState) -> Ipv4Addr {
+    match state.server_addr.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        _ => Ipv4Addr::UNSPECIFIED,
+    }
+}
+
 pub fn run(state: Arc<ServerState>) {
     let multicast = SocketAddrV4::new(MULTICAST_ADDR, SSDP_PORT);
 
-    // Try to bind to the standard SSDP port; fall back to random if another server owns it.
-    let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT))
+    // Bind to the standard SSDP port with reuse flags so we can share it with
+    // other SSDP servers; fall back to a random port as a last resort.
+    let sock = bind_ssdp_socket()
         .or_else(|_| UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
 
     let sock = match sock {
@@ -24,10 +42,15 @@ pub fn run(state: Arc<ServerState>) {
         }
     };
 
-    // Join multicast group
-    if let Err(e) = sock.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {
+    let iface = multicast_iface(&state);
+
+    // Join multicast group on the interface we serve on
+    if let Err(e) = sock.join_multicast_v4(&MULTICAST_ADDR, &iface) {
         log::warn!("SSDP: failed to join multicast: {}", e);
         // Continue anyway — we can still send NOTIFYs
+    }
+    if let Err(e) = socket2::SockRef::from(&sock).set_multicast_if_v4(&iface) {
+        log::warn!("SSDP: failed to set multicast interface: {}", e);
     }
 
     let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
@@ -107,6 +130,16 @@ fn send_alive(sock: &UdpSocket, state: &ServerState, dest: SocketAddrV4) {
         );
         let _ = sock.send_to(msg.as_bytes(), dest);
     }
+}
+
+/// Send byebye NOTIFYs on a fresh socket. Used at shutdown when the SSDP
+/// thread may already be gone; a few UDP sends, effectively instant.
+pub fn send_byebye_now(state: &ServerState) {
+    let Ok(sock) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) else {
+        return;
+    };
+    let _ = socket2::SockRef::from(&sock).set_multicast_if_v4(&multicast_iface(state));
+    send_byebye(&sock, state, SocketAddrV4::new(MULTICAST_ADDR, SSDP_PORT));
 }
 
 fn send_byebye(sock: &UdpSocket, state: &ServerState, dest: SocketAddrV4) {

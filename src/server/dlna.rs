@@ -140,8 +140,13 @@ pub fn connection_manager_scpd() -> &'static str {
 }
 
 /// Handle a SOAP action on ContentDirectory.
-pub fn handle_content_directory(body: &str, addr: SocketAddr, image_paths: &[std::path::PathBuf]) -> String {
-    let action = extract_soap_action(body);
+pub fn handle_content_directory(
+    soapaction: Option<&str>,
+    body: &str,
+    addr: SocketAddr,
+    image_paths: &[std::path::PathBuf],
+) -> String {
+    let action = extract_soap_action(soapaction, body);
     match action.as_deref() {
         Some("Browse") => handle_browse(body, addr, image_paths),
         Some("GetSystemUpdateID") => soap_response("GetSystemUpdateID", "<Id>1</Id>"),
@@ -152,8 +157,8 @@ pub fn handle_content_directory(body: &str, addr: SocketAddr, image_paths: &[std
 }
 
 /// Handle a SOAP action on ConnectionManager.
-pub fn handle_connection_manager(body: &str) -> String {
-    let action = extract_soap_action(body);
+pub fn handle_connection_manager(soapaction: Option<&str>, body: &str) -> String {
+    let action = extract_soap_action(soapaction, body);
     match action.as_deref() {
         Some("GetProtocolInfo") => soap_response(
             "GetProtocolInfo",
@@ -170,21 +175,39 @@ pub fn handle_connection_manager(body: &str) -> String {
     }
 }
 
-fn extract_soap_action(body: &str) -> Option<String> {
-    // Look for the action name in the SOAP body, e.g. <u:Browse ...> or soapaction header
-    // Try to find <u:ActionName or <ActionName in the body
-    for prefix in &["<u:", "<m:", "<"] {
-        if let Some(start) = body.find(prefix) {
-            let rest = &body[start + prefix.len()..];
-            let end = rest.find(|c: char| c == ' ' || c == '>' || c == '/')?;
-            let action = &rest[..end];
-            // Skip known non-action tags
-            if !matches!(action, "Envelope" | "Body" | "Header" | "s:Envelope" | "s:Body") {
+/// The SOAPACTION header (`"urn:...:service:ContentDirectory:1#Browse"`) is
+/// the authoritative source; body parsing is a fallback for odd clients.
+fn extract_soap_action(soapaction: Option<&str>, body: &str) -> Option<String> {
+    if let Some(value) = soapaction {
+        let value = value.trim().trim_matches('"');
+        if let Some(pos) = value.rfind('#') {
+            let action = &value[pos + 1..];
+            if !action.is_empty() {
                 return Some(action.to_string());
             }
         }
     }
-    None
+    extract_soap_action_from_body(body)
+}
+
+fn extract_soap_action_from_body(body: &str) -> Option<String> {
+    // First element inside the envelope that isn't Envelope/Header/Body,
+    // regardless of namespace prefix. Skips XML declarations and comments.
+    let mut rest = body;
+    loop {
+        let start = rest.find('<')?;
+        rest = &rest[start + 1..];
+        if rest.starts_with(['?', '!', '/']) {
+            continue;
+        }
+        let end = rest.find([' ', '\t', '\r', '\n', '>', '/'])?;
+        let name = &rest[..end];
+        let local = name.rsplit(':').next().unwrap_or(name);
+        if !local.is_empty() && !matches!(local, "Envelope" | "Header" | "Body") {
+            return Some(local.to_string());
+        }
+        rest = &rest[end..];
+    }
 }
 
 /// Max items per browse page when client sends RequestedCount=0 (meaning "all").
@@ -288,9 +311,17 @@ fn build_didl_item_full(index: usize, path: &Path, addr: SocketAddr) -> String {
     let filename = url_filename(path);
     let image_url = format!("http://{addr}/image/{index}/{filename}");
     let thumb_url = format!("http://{addr}/thumb/{index}/thumb_{index}.jpg");
-    let size_attr = std::fs::metadata(path)
-        .map(|m| format!(r#" size="{}""#, m.len()))
-        .unwrap_or_default();
+    // The on-disk size is wrong for transcoded items (HEIC/rotated → JPEG),
+    // so only report it when the file is served as-is.
+    let transcoded =
+        crate::heic_decode::is_heic(path) || crate::thumbnail::read_orientation(path) > 1;
+    let size_attr = if transcoded {
+        String::new()
+    } else {
+        std::fs::metadata(path)
+            .map(|m| format!(r#" size="{}""#, m.len()))
+            .unwrap_or_default()
+    };
     let resolution_attr = image::image_dimensions(path)
         .map(|(w, h)| format!(r#" resolution="{w}x{h}""#))
         .unwrap_or_default();

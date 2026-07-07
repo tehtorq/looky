@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,7 @@ const DLNA_IMAGE_MAX: u32 = 3840;
 const DLNA_TRANSFER_INTERACTIVE: &str = "transferMode.dlna.org: Interactive";
 const DLNA_CONTENT_FEATURES: &str = "contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
 const MAX_SOAP_BODY: u64 = 256 * 1024;
+const THUMB_CACHE_MAX: usize = 512;
 
 type HttpResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -242,7 +243,8 @@ fn serve_thumbnail(
                         .unwrap(),
                 )
                 .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
-                .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
+                .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap())
+                .with_chunked_threshold(usize::MAX);
             request.respond(response)?;
             return Ok(());
         }
@@ -252,9 +254,12 @@ fn serve_thumbnail(
     let path = &state.image_paths[index];
     let jpeg_bytes = thumbnail::thumbnail_jpeg_bytes(path, THUMB_MAX_SIZE, THUMB_QUALITY);
 
-    // Store in cache
+    // Store in cache, clearing it first if it has grown too large
     {
         let mut lock = cache.lock().unwrap();
+        if lock.len() >= THUMB_CACHE_MAX {
+            lock.clear();
+        }
         lock.insert(index, jpeg_bytes.clone());
     }
 
@@ -270,9 +275,135 @@ fn serve_thumbnail(
                 .unwrap(),
         )
         .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
-        .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
+        .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap())
+        .with_chunked_threshold(usize::MAX);
     request.respond(response)?;
     Ok(())
+}
+
+/// Outcome of parsing a Range request header against an entity of known length.
+enum RangeOutcome {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+/// Parse a single-range `bytes=start-[end]` (or suffix `bytes=-n`) header.
+/// Malformed or multi-range values fall back to serving the full entity.
+fn parse_range(value: &str, len: u64) -> RangeOutcome {
+    let Some(spec) = value.trim().strip_prefix("bytes=") else {
+        return RangeOutcome::Full;
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (start_s, end_s) = (start_s.trim(), end_s.trim());
+
+    if start_s.is_empty() {
+        // Suffix range: last n bytes
+        let Ok(n) = end_s.parse::<u64>() else {
+            return RangeOutcome::Full;
+        };
+        if n == 0 || len == 0 {
+            return RangeOutcome::Unsatisfiable;
+        }
+        return RangeOutcome::Partial {
+            start: len.saturating_sub(n),
+            end: len - 1,
+        };
+    }
+
+    let Ok(start) = start_s.parse::<u64>() else {
+        return RangeOutcome::Full;
+    };
+    if start >= len {
+        return RangeOutcome::Unsatisfiable;
+    }
+    let end = if end_s.is_empty() {
+        len - 1
+    } else {
+        match end_s.parse::<u64>() {
+            Ok(e) if e >= start => e.min(len - 1),
+            _ => return RangeOutcome::Full,
+        }
+    };
+    RangeOutcome::Partial { start, end }
+}
+
+fn requested_range(request: &tiny_http::Request, len: u64) -> RangeOutcome {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Range"))
+        .map(|h| parse_range(h.value.as_str(), len))
+        .unwrap_or(RangeOutcome::Full)
+}
+
+fn image_headers(mime: &str) -> Vec<tiny_http::Header> {
+    vec![
+        format!("Content-Type: {mime}").parse().unwrap(),
+        "Cache-Control: public, max-age=3600".parse().unwrap(),
+        "Accept-Ranges: bytes".parse().unwrap(),
+        DLNA_TRANSFER_INTERACTIVE.parse().unwrap(),
+        DLNA_CONTENT_FEATURES.parse().unwrap(),
+    ]
+}
+
+fn serve_416(request: tiny_http::Request, len: u64) -> HttpResult {
+    let response = tiny_http::Response::from_string("")
+        .with_status_code(416)
+        .with_header(
+            format!("Content-Range: bytes */{len}")
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        );
+    request.respond(response)?;
+    Ok(())
+}
+
+/// Serve an in-memory entity honoring a single-range Range header.
+fn serve_bytes_ranged(request: tiny_http::Request, bytes: Vec<u8>, mime: &str) -> HttpResult {
+    let total = bytes.len() as u64;
+    match requested_range(&request, total) {
+        RangeOutcome::Unsatisfiable => serve_416(request, total),
+        RangeOutcome::Partial { start, end } => {
+            let slice = bytes[start as usize..=end as usize].to_vec();
+            let mut headers = image_headers(mime);
+            headers.push(
+                format!("Content-Range: bytes {start}-{end}/{total}")
+                    .parse()
+                    .unwrap(),
+            );
+            let len = slice.len();
+            let response = tiny_http::Response::new(
+                tiny_http::StatusCode(206),
+                headers,
+                std::io::Cursor::new(slice),
+                Some(len),
+                None,
+            )
+            .with_chunked_threshold(usize::MAX);
+            request.respond(response)?;
+            Ok(())
+        }
+        RangeOutcome::Full => {
+            let len = bytes.len();
+            let response = tiny_http::Response::new(
+                tiny_http::StatusCode(200),
+                image_headers(mime),
+                std::io::Cursor::new(bytes),
+                Some(len),
+                None,
+            )
+            .with_chunked_threshold(usize::MAX);
+            request.respond(response)?;
+            Ok(())
+        }
+    }
 }
 
 fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -> HttpResult {
@@ -311,33 +442,49 @@ fn serve_image(request: tiny_http::Request, state: &ServerState, index: usize) -
         use image::ImageEncoder;
         encoder.write_image(resized.to_rgb8().as_raw(), w, h, image::ExtendedColorType::Rgb8)?;
 
-        let response = tiny_http::Response::from_data(buf)
-            .with_header("Content-Type: image/jpeg".parse::<tiny_http::Header>().unwrap())
-            .with_header("Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap())
-            .with_header(DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap())
-            .with_header(DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap());
-        request.respond(response)?;
+        serve_bytes_ranged(request, buf, "image/jpeg")?;
     } else {
-        let file = std::fs::File::open(path)?;
+        let mut file = std::fs::File::open(path)?;
         let len = file.metadata()?.len();
         let mime = dlna::mime_for_path(path);
 
         log::debug!("Serving image {index}: path={} mime={mime} size={len}", path.display());
 
-        let reader = std::io::BufReader::new(file);
-        let response = tiny_http::Response::new(
-            tiny_http::StatusCode(200),
-            vec![
-                format!("Content-Type: {mime}").parse::<tiny_http::Header>().unwrap(),
-                "Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap(),
-                DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
-                DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
-            ],
-            reader,
-            Some(len as usize),
-            None,
-        );
-        request.respond(response)?;
+        match requested_range(&request, len) {
+            RangeOutcome::Unsatisfiable => return serve_416(request, len),
+            RangeOutcome::Partial { start, end } => {
+                file.seek(SeekFrom::Start(start))?;
+                let range_len = end - start + 1;
+                let reader = std::io::BufReader::new(file).take(range_len);
+                let mut headers = image_headers(mime);
+                headers.push(
+                    format!("Content-Range: bytes {start}-{end}/{len}")
+                        .parse()
+                        .unwrap(),
+                );
+                let response = tiny_http::Response::new(
+                    tiny_http::StatusCode(206),
+                    headers,
+                    reader,
+                    Some(range_len as usize),
+                    None,
+                )
+                .with_chunked_threshold(usize::MAX);
+                request.respond(response)?;
+            }
+            RangeOutcome::Full => {
+                let reader = std::io::BufReader::new(file);
+                let response = tiny_http::Response::new(
+                    tiny_http::StatusCode(200),
+                    image_headers(mime),
+                    reader,
+                    Some(len as usize),
+                    None,
+                )
+                .with_chunked_threshold(usize::MAX);
+                request.respond(response)?;
+            }
+        }
     }
     Ok(())
 }
@@ -351,7 +498,8 @@ fn serve_cast_image(request: tiny_http::Request, state: &ServerState, index: usi
     let jpeg_bytes = thumbnail::thumbnail_jpeg_bytes(path, CAST_MAX_SIZE, CAST_QUALITY);
     let response = tiny_http::Response::from_data(jpeg_bytes)
         .with_header("Content-Type: image/jpeg".parse::<tiny_http::Header>().unwrap())
-        .with_header("Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap());
+        .with_header("Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap())
+        .with_chunked_threshold(usize::MAX);
     request.respond(response)?;
     Ok(())
 }
@@ -372,6 +520,7 @@ fn serve_image_head(
     let mut headers = vec![
         format!("Content-Type: {mime}").parse::<tiny_http::Header>().unwrap(),
         "Cache-Control: public, max-age=3600".parse::<tiny_http::Header>().unwrap(),
+        "Accept-Ranges: bytes".parse::<tiny_http::Header>().unwrap(),
         DLNA_TRANSFER_INTERACTIVE.parse::<tiny_http::Header>().unwrap(),
         DLNA_CONTENT_FEATURES.parse::<tiny_http::Header>().unwrap(),
     ];
@@ -389,7 +538,8 @@ fn serve_image_head(
         std::io::empty(),
         Some(0),
         None,
-    );
+    )
+    .with_chunked_threshold(usize::MAX);
     request.respond(response)?;
     Ok(())
 }
@@ -404,15 +554,30 @@ fn serve_static_xml(request: tiny_http::Request, xml: &str) -> HttpResult {
 }
 
 fn serve_soap_content(mut request: tiny_http::Request, state: &ServerState) -> HttpResult {
+    let soapaction = soap_action_header(&request);
     let body = read_bounded_body(&mut request)?;
-    let xml = dlna::handle_content_directory(&body, state.server_addr, &state.image_paths);
+    let xml = dlna::handle_content_directory(
+        soapaction.as_deref(),
+        &body,
+        state.server_addr,
+        &state.image_paths,
+    );
     respond_xml(request, xml)
 }
 
 fn serve_soap_connection(mut request: tiny_http::Request) -> HttpResult {
+    let soapaction = soap_action_header(&request);
     let body = read_bounded_body(&mut request)?;
-    let xml = dlna::handle_connection_manager(&body);
+    let xml = dlna::handle_connection_manager(soapaction.as_deref(), &body);
     respond_xml(request, xml)
+}
+
+fn soap_action_header(request: &tiny_http::Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("SOAPACTION"))
+        .map(|h| h.value.as_str().to_string())
 }
 
 /// Read at most MAX_SOAP_BODY bytes. Prevents a misbehaving (or hostile) DLNA

@@ -18,6 +18,7 @@ image_hasher = "3"
 dirs-next = "2"
 rand = "0.9"
 tiny_http = "0.12"
+socket2 = "0.6"
 rust_cast = { version = "0.21", features = ["thread_safe"] }
 mdns-sd = "0.17"
 qrcode = "0.14"

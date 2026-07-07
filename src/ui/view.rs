@@ -11,6 +11,13 @@ pub fn view(state: &Looky) -> Element<'_, Message> {
     let is_zoomed = state.viewer.is_zoomed();
     let screensaver = state.screensaver_active;
     let menu_open = state.menu_open;
+    // Nothing open to "go back" from — a right-click here must not fall
+    // through to escape's final window-close branch.
+    let at_top_level = !in_viewer
+        && !state.dup_view_active
+        && state.dup_compare.is_none()
+        && state.selected_thumb.is_none()
+        && !state.fullscreen;
     KeyListener::new(content, move |key, repeat| {
         use iced::keyboard::key::Named;
         use iced::keyboard::Key;
@@ -71,6 +78,10 @@ pub fn view(state: &Looky) -> Element<'_, Message> {
         if screensaver { return Some(Message::KeyEscape); }
         if in_viewer && is_zoomed {
             Some(Message::ViewerClickUnzoom(cx, cy))
+        } else if menu_open {
+            Some(Message::ToggleMenu)
+        } else if at_top_level {
+            None
         } else {
             Some(Message::KeyEscape)
         }
@@ -82,7 +93,7 @@ pub fn view(state: &Looky) -> Element<'_, Message> {
     .into()
 }
 
-fn build_viewer(state: &Looky, index: usize, screensaver: bool) -> Element<'_, Message> {
+fn build_viewer(state: &Looky, index: usize) -> Element<'_, Message> {
     let full_handle = state.viewer_cache.get(&index);
     let thumb_handle = state.thumbnails.get(index).map(|(_, h, _)| h);
     viewer_view::viewer_view(
@@ -96,7 +107,6 @@ fn build_viewer(state: &Looky, index: usize, screensaver: bool) -> Element<'_, M
         state.viewer_dimensions.get(&index).copied(),
         state.viewport_width,
         state.viewport_height,
-        screensaver,
     )
 }
 
@@ -107,7 +117,7 @@ fn view_inner(state: &Looky) -> Element<'_, Message> {
 
     let content: Element<'_, Message> = if let Some(index) = state.viewer.current_index {
         if state.image_paths.get(index).is_some() {
-            build_viewer(state, index, false)
+            build_viewer(state, index)
         } else {
             container(Space::new()).into()
         }

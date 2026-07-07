@@ -9,21 +9,21 @@ use crate::thumbnail;
 const THUMBNAIL_BATCH_SIZE: usize = 32;
 const PREVIEW_BATCH_SIZE: usize = 16;
 const MAX_UPGRADE_BATCHES_IN_FLIGHT: usize = 3;
-const DUP_HASH_BATCH_SIZE: usize = 32;
+const DUP_HASH_BATCH_SIZE: usize = 16;
+/// How many neighbors to keep decoded at full resolution on each side of the
+/// current photo. Each entry is a full-res RGBA frame, so keep this small.
+pub const PRELOAD_RADIUS: usize = 1;
 
-pub fn load_next_batch(state: &mut Looky) -> Task<Message> {
-    if state.pending_thumbnails.is_empty() {
-        state.loading = false;
-        return Task::none();
-    }
-
-    let count = THUMBNAIL_BATCH_SIZE.min(state.pending_thumbnails.len());
-    let batch: Vec<PathBuf> = state.pending_thumbnails.drain(..count).collect();
-
-    Task::perform(
-        async move { thumbnail::generate_thumbnails_parallel(&batch, 400) },
-        Message::ThumbnailBatchReady,
-    )
+/// Run a blocking/CPU-heavy closure on its own thread instead of stalling the
+/// iced executor, which also drives every other in-flight Task.
+pub fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> impl Future<Output = T> + Send + 'static {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    async move { rx.await.expect("blocking task panicked") }
 }
 
 pub fn load_next_preview_batch(state: &mut Looky) -> Task<Message> {
@@ -33,10 +33,11 @@ pub fn load_next_preview_batch(state: &mut Looky) -> Task<Message> {
 
     let count = PREVIEW_BATCH_SIZE.min(state.pending_thumbnails.len());
     let batch: Vec<PathBuf> = state.pending_thumbnails.drain(..count).collect();
+    let generation = state.scan_generation;
 
     Task::perform(
-        async move { thumbnail::extract_previews_parallel(&batch, 400) },
-        Message::PreviewBatchReady,
+        run_blocking(move || thumbnail::extract_previews_parallel(&batch, 400)),
+        move |results| Message::PreviewBatchReady(generation, results),
     )
 }
 
@@ -48,9 +49,10 @@ pub fn load_upgrade_batches(state: &mut Looky) -> Task<Message> {
         let count = THUMBNAIL_BATCH_SIZE.min(state.pending_upgrades.len());
         let batch: Vec<PathBuf> = state.pending_upgrades.drain(..count).collect();
         state.upgrade_batches_in_flight += 1;
+        let generation = state.scan_generation;
         tasks.push(Task::perform(
-            async move { thumbnail::generate_thumbnails_parallel(&batch, 400) },
-            Message::ThumbnailUpgradeReady,
+            run_blocking(move || thumbnail::generate_thumbnails_parallel(&batch, 400)),
+            move |results| Message::ThumbnailUpgradeReady(generation, results),
         ));
     }
     Task::batch(tasks)
@@ -63,10 +65,11 @@ pub fn load_next_dup_batch(state: &mut Looky) -> Task<Message> {
 
     let count = DUP_HASH_BATCH_SIZE.min(state.dup_pending.len());
     let batch: Vec<(usize, PathBuf)> = state.dup_pending.drain(..count).collect();
+    let generation = state.dup_generation;
 
     Task::perform(
-        async move { duplicates::compute_hashes_batch(&batch) },
-        Message::DupHashBatchReady,
+        run_blocking(move || duplicates::compute_hashes_batch(&batch)),
+        move |results| Message::DupHashBatchReady(generation, results),
     )
 }
 
@@ -86,22 +89,7 @@ pub fn preload_viewer_images(state: &mut Looky) -> Task<Message> {
         return preload_viewer_neighbors(state);
     }
     log::debug!("viewer: [{}] loading (current)", idx);
-    let path = state.image_paths[idx].clone();
-    let (task, handle) = Task::perform(
-        async move {
-            match open_image_oriented(&path) {
-                Some(rgba) => {
-                    let (w, h) = rgba.dimensions();
-                    Message::ViewerImageLoaded(idx, rgba.into_raw(), w, h)
-                }
-                None => Message::Tick,
-            }
-        },
-        |msg| msg,
-    )
-    .abortable();
-    state.viewer_preload_handles.push((idx, handle));
-    task
+    spawn_viewer_load(state, idx)
 }
 
 pub fn preload_viewer_neighbors(state: &mut Looky) -> Task<Message> {
@@ -110,47 +98,39 @@ pub fn preload_viewer_neighbors(state: &mut Looky) -> Task<Message> {
     };
     let total = state.image_paths.len();
     let mut tasks = Vec::new();
-    let start = idx.saturating_sub(3);
-    let end = (idx + 3).min(total.saturating_sub(1));
+    let start = idx.saturating_sub(PRELOAD_RADIUS);
+    let end = (idx + PRELOAD_RADIUS).min(total.saturating_sub(1));
     for i in start..=end {
         if i != idx && !state.viewer_cache.contains_key(&i) {
-            let path = state.image_paths[i].clone();
-            let index = i;
             log::debug!("viewer: [{}] loading (neighbor)", i);
-            let (task, handle) = Task::perform(
-                async move {
-                    match open_image_oriented(&path) {
-                        Some(rgba) => {
-                            let (w, h) = rgba.dimensions();
-                            Message::ViewerImageLoaded(index, rgba.into_raw(), w, h)
-                        }
-                        None => Message::Tick,
-                    }
-                },
-                |msg| msg,
-            )
-            .abortable();
-            state.viewer_preload_handles.push((i, handle));
-            tasks.push(task);
+            tasks.push(spawn_viewer_load(state, i));
         }
     }
     Task::batch(tasks)
 }
 
+fn spawn_viewer_load(state: &mut Looky, index: usize) -> Task<Message> {
+    let Some(path) = state.image_paths.get(index).cloned() else {
+        return Task::none();
+    };
+    let generation = state.scan_generation;
+    let (task, handle) = Task::perform(
+        run_blocking(move || match open_image_oriented(&path) {
+            Some(rgba) => {
+                let (w, h) = rgba.dimensions();
+                Message::ViewerImageLoaded(generation, index, rgba.into_raw(), w, h)
+            }
+            None => Message::ViewerImageFailed(index),
+        }),
+        |msg| msg,
+    )
+    .abortable();
+    state.viewer_preload_handles.push((index, handle));
+    task
+}
 
 fn open_image_oriented(path: &std::path::Path) -> Option<::image::RgbaImage> {
     let img = ::image::open(path).ok().or_else(|| crate::heic_decode::open_heic(path))?;
-    let orientation = thumbnail::read_orientation(path);
-    let oriented = match orientation {
-        2 => img.fliph(),
-        3 => img.rotate180(),
-        4 => img.flipv(),
-        5 => img.rotate90().fliph(),
-        6 => img.rotate90(),
-        7 => img.rotate270().fliph(),
-        8 => img.rotate270(),
-        _ => img,
-    };
+    let oriented = thumbnail::apply_orientation(img, thumbnail::read_orientation(path));
     Some(oriented.to_rgba8())
 }
-

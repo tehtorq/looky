@@ -16,6 +16,10 @@ const SCREENSAVER_MAX_CARDS: usize = 20;
 
 pub fn folder_selected(state: &mut Looky, path: PathBuf) -> Task<Message> {
     fs_scan::save_last_folder(&path);
+    // Invalidate every in-flight async result from the previous folder —
+    // indices and paths are about to mean something else entirely.
+    state.scan_generation += 1;
+    state.dup_generation += 1;
     if let Some(session) = state.cast_session.take() {
         session.stop();
     }
@@ -29,6 +33,7 @@ pub fn folder_selected(state: &mut Looky, path: PathBuf) -> Task<Message> {
     state.qr_handle = None;
     state.folder = Some(path.clone());
     state.thumbnails.clear();
+    state.last_thumb_added = None;
     state.image_paths.clear();
     state.pending_thumbnails.clear();
     state.thumbnail_index.clear();
@@ -36,23 +41,42 @@ pub fn folder_selected(state: &mut Looky, path: PathBuf) -> Task<Message> {
     state.upgrade_batches_in_flight = 0;
     state.viewer = ViewerState::default();
     state.loading = true;
+    for (_, handle) in state.viewer_preload_handles.drain(..) {
+        handle.abort();
+    }
+    state.viewer_cache.clear();
+    state.viewer_dimensions.clear();
+    state.cached_metadata = None;
+    state.selected_thumb = None;
+    state.grid_scroll_y = 0.0;
+    state.dup_scroll_y = 0.0;
     state.dup_hashes.clear();
     state.dup_pending.clear();
     state.dup_scanning = false;
+    state.dup_total = 0;
     state.dup_groups.clear();
     state.dup_badge_set.clear();
     state.dup_view_active = false;
     state.dup_compare = None;
     state.dup_summaries.clear();
-    Task::perform(fs_scan::scan_folder(path), Message::ImagesFound)
+    let generation = state.scan_generation;
+    Task::perform(
+        tasks::run_blocking(move || fs_scan::scan_folder(path)),
+        move |paths| Message::ImagesFound(generation, paths),
+    )
 }
 
 pub fn images_found(state: &mut Looky, paths: Vec<PathBuf>) -> Task<Message> {
-    if let Some(cat) = state.catalog.as_ref() {
-        cat.prune_missing();
+    if let (Some(cat), Some(folder)) = (state.catalog.as_mut(), state.folder.clone()) {
+        let present: std::collections::HashSet<PathBuf> = paths.iter().cloned().collect();
+        cat.prune_stale(&folder, &present);
     }
     state.image_paths = paths.clone();
     state.pending_thumbnails = paths;
+    if state.image_paths.is_empty() {
+        state.loading = false;
+        return Task::none();
+    }
     if let Some(dup_task) = dup_update::images_found_dup_bootstrap(state) {
         return Task::batch([tasks::load_next_preview_batch(state), dup_task]);
     }
@@ -71,15 +95,10 @@ pub fn viewer_image_loaded(
     state.viewer_cache.insert(index, handle);
     state.viewer_dimensions.insert(index, (width, height));
     if let Some(current) = state.viewer.current_index {
-        let keep_min = current.saturating_sub(3);
-        let keep_max = current + 3;
-        let ss_next = if state.screensaver_active {
-            state.screensaver_order.get(state.screensaver_position + 1).copied()
-        } else {
-            None
-        };
-        state.viewer_cache.retain(|&k, _| (k >= keep_min && k <= keep_max) || ss_next == Some(k));
-        state.viewer_dimensions.retain(|&k, _| (k >= keep_min && k <= keep_max) || ss_next == Some(k));
+        let keep_min = current.saturating_sub(tasks::PRELOAD_RADIUS);
+        let keep_max = current + tasks::PRELOAD_RADIUS;
+        state.viewer_cache.retain(|&k, _| k >= keep_min && k <= keep_max);
+        state.viewer_dimensions.retain(|&k, _| k >= keep_min && k <= keep_max);
         if index == current {
             return tasks::preload_viewer_neighbors(state);
         }
@@ -107,6 +126,8 @@ pub fn escape(state: &mut Looky) -> Task<Message> {
     } else if state.viewer.current_index.is_some() {
         state.viewer.close();
         state.cached_metadata = None;
+        state.viewer_cache.clear();
+        state.viewer_dimensions.clear();
         return grid::restore_grid_scroll(state);
     } else if state.dup_compare.is_some() {
         state.dup_compare = None;
@@ -127,8 +148,10 @@ pub fn arrow(state: &mut Looky, dx: i32, dy: i32) -> Task<Message> {
     if dy == 0 && state.viewer.current_index.is_some() {
         if dx < 0 { state.viewer.prev(); } else { state.viewer.next(state.image_paths.len()); }
         state.selected_thumb = state.viewer.current_index;
-        refresh_metadata(state);
-        return tasks::preload_viewer_images(state);
+        return Task::batch([
+            refresh_metadata(state),
+            tasks::preload_viewer_images(state),
+        ]);
     }
     if !state.dup_view_active && state.dup_compare.is_none() && state.viewer.current_index.is_none() {
         let delta = if dy != 0 { dy * state.grid_columns.max(1) as i32 } else { dx };
@@ -187,16 +210,16 @@ pub fn screensaver_advance(state: &mut Looky) -> Task<Message> {
 
 fn add_screensaver_card(state: &mut Looky) {
     let loaded = state.thumbnails.len();
-    if loaded == 0 {
+    if loaded == 0 || state.screensaver_order.is_empty() {
         return;
     }
-    state.screensaver_position += 1;
     if state.screensaver_position >= state.screensaver_order.len() {
         use rand::seq::SliceRandom;
         state.screensaver_order.shuffle(&mut rand::rng());
         state.screensaver_position = 0;
     }
     let idx = state.screensaver_order[state.screensaver_position] % loaded;
+    state.screensaver_position += 1;
 
     let vw = state.viewport_width;
     let vh = state.viewport_height;
@@ -251,13 +274,20 @@ fn pick_placement(state: &Looky, vw: f32, vh: f32) -> (f32, f32, f32) {
     (x, y, size)
 }
 
-pub fn refresh_metadata(state: &mut Looky) {
-    if let Some(index) = state.viewer.current_index {
-        if state.cached_metadata.as_ref().is_some_and(|(i, _)| *i == index) {
-            return;
-        }
-        if let Some(path) = state.image_paths.get(index) {
-            state.cached_metadata = Some((index, metadata::read_metadata(path)));
-        }
+/// Load metadata for the current photo off-thread (EXIF parse + header read
+/// can hitch the UI on slow volumes). Result arrives as MetadataLoaded.
+pub fn refresh_metadata(state: &mut Looky) -> Task<Message> {
+    let Some(index) = state.viewer.current_index else {
+        return Task::none();
+    };
+    if state.cached_metadata.as_ref().is_some_and(|(i, _)| *i == index) {
+        return Task::none();
     }
+    let Some(path) = state.image_paths.get(index).cloned() else {
+        return Task::none();
+    };
+    Task::perform(
+        tasks::run_blocking(move || metadata::read_metadata(&path)),
+        move |meta| Message::MetadataLoaded(index, Box::new(meta)),
+    )
 }

@@ -144,18 +144,18 @@ impl ViewerState {
     }
 
     pub fn next(&mut self, total: usize) {
-        if let Some(i) = self.current_index {
-            if i + 1 < total {
-                self.navigate_to(i + 1);
-            }
+        if let Some(i) = self.current_index
+            && i + 1 < total
+        {
+            self.navigate_to(i + 1);
         }
     }
 
     pub fn prev(&mut self) {
-        if let Some(i) = self.current_index {
-            if i > 0 {
-                self.navigate_to(i - 1);
-            }
+        if let Some(i) = self.current_index
+            && i > 0
+        {
+            self.navigate_to(i - 1);
         }
     }
 
@@ -173,10 +173,10 @@ impl ViewerState {
     }
 
     pub fn tick(&mut self) {
-        if let Some(progress) = self.transition_progress() {
-            if progress >= 1.0 {
-                self.transition = None;
-            }
+        if let Some(progress) = self.transition_progress()
+            && progress >= 1.0
+        {
+            self.transition = None;
         }
     }
 }

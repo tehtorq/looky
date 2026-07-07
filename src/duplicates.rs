@@ -5,10 +5,25 @@ use image_hasher::{HashAlg, HasherConfig};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+/// Bytes in the perceptual hash (8x8 gradient hash). Cached hashes of any
+/// other length are stale and must be recomputed.
+pub const PHASH_LEN: usize = 8;
+
+/// Bumped whenever the perceptual hash computation changes (algorithm,
+/// size, or preprocessing such as orientation) to invalidate cached hashes.
+pub const HASH_VERSION: i64 = 2;
+
 #[derive(Debug, Clone)]
 pub struct ImageHashes {
     pub content_hash: [u8; 32],
     pub perceptual_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HashResult {
+    pub hashes: ImageHashes,
+    pub file_size: u64,
+    pub mtime_ns: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -24,7 +39,10 @@ pub struct DuplicateGroup {
 }
 
 /// Compute SHA-256 and perceptual hash for a single image.
-pub fn compute_hashes(path: &Path) -> Option<ImageHashes> {
+/// Size/mtime are captured before reading so a mid-hash file edit can't be
+/// recorded as fresh in the catalog.
+pub fn compute_hashes(path: &Path) -> Option<HashResult> {
+    let (file_size, mtime_ns) = crate::catalog::file_size_and_mtime_for(path)?;
     let file_bytes = std::fs::read(path).ok()?;
 
     // SHA-256 content hash
@@ -33,6 +51,8 @@ pub fn compute_hashes(path: &Path) -> Option<ImageHashes> {
     let img = image::load_from_memory(&file_bytes)
         .ok()
         .or_else(|| crate::heic_decode::open_heic(path))?;
+    // Orient before hashing so a photo and its EXIF-rotated copy match.
+    let img = crate::thumbnail::apply_orientation(img, crate::thumbnail::read_orientation(path));
     let hasher = HasherConfig::new()
         .hash_alg(HashAlg::Gradient)
         .hash_size(8, 8)
@@ -40,14 +60,18 @@ pub fn compute_hashes(path: &Path) -> Option<ImageHashes> {
     let phash = hasher.hash_image(&img);
     let perceptual_hash = phash.as_bytes().to_vec();
 
-    Some(ImageHashes {
-        content_hash,
-        perceptual_hash,
+    Some(HashResult {
+        hashes: ImageHashes {
+            content_hash,
+            perceptual_hash,
+        },
+        file_size,
+        mtime_ns,
     })
 }
 
 /// Compute hashes for a batch of (index, path) pairs in parallel.
-pub fn compute_hashes_batch(items: &[(usize, PathBuf)]) -> Vec<(usize, Option<ImageHashes>)> {
+pub fn compute_hashes_batch(items: &[(usize, PathBuf)]) -> Vec<(usize, Option<HashResult>)> {
     items
         .par_iter()
         .map(|(idx, path)| (*idx, compute_hashes(path)))
@@ -78,11 +102,19 @@ pub fn find_duplicates(hashes: &[(usize, ImageHashes)], threshold: u32) -> Vec<D
         }
     }
 
-    // Phase 2: Visual matches via perceptual hash hamming distance
-    // Collect non-exact hashes for pairwise comparison
+    // Phase 2: Visual matches via perceptual hash hamming distance.
+    // Keep one representative per exact group so near-duplicates of an
+    // exact-matched file still get found (e.g. A==B byte-identical, C resized:
+    // C must be able to match against A).
+    let mut exact_representatives: HashSet<usize> = HashSet::new();
+    for indices in sha_groups.values() {
+        if indices.len() > 1 {
+            exact_representatives.insert(indices[0]);
+        }
+    }
     let non_exact: Vec<(usize, &[u8])> = hashes
         .iter()
-        .filter(|(idx, _)| !exact_matched.contains(idx))
+        .filter(|(idx, _)| !exact_matched.contains(idx) || exact_representatives.contains(idx))
         .map(|(idx, h)| (*idx, h.perceptual_hash.as_slice()))
         .collect();
 
@@ -175,6 +207,11 @@ pub fn duplicate_indices(groups: &[DuplicateGroup]) -> HashSet<usize> {
 }
 
 fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
+    // A truncated zip would give short/corrupt hashes tiny distances (an
+    // empty hash would match everything), so length mismatch = no match.
+    if a.len() != b.len() || a.is_empty() {
+        return u32::MAX;
+    }
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x ^ y).count_ones())

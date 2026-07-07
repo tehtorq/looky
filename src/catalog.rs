@@ -1,11 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, Result, params};
 
+use crate::duplicates::{HASH_VERSION, PHASH_LEN};
 use crate::metadata::FileSummary;
 
 pub struct Catalog {
     conn: Connection,
+    db_path: PathBuf,
 }
 
 impl Catalog {
@@ -14,9 +16,20 @@ impl Catalog {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(db_path)?;
-        let catalog = Catalog { conn };
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        let catalog = Catalog {
+            conn,
+            db_path: db_path.to_path_buf(),
+        };
         catalog.init_schema()?;
         Ok(catalog)
+    }
+
+    /// Open a second connection to the same database, for use off the UI thread.
+    pub fn try_clone(&self) -> Option<Catalog> {
+        Catalog::open(&self.db_path).ok()
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -35,7 +48,14 @@ impl Catalog {
             );
 
             CREATE INDEX IF NOT EXISTS idx_images_content_hash ON images(content_hash);",
-        )
+        )?;
+        // Migration: track the hash algorithm version so stale perceptual
+        // hashes are recomputed instead of silently compared. Errors mean the
+        // column already exists.
+        let _ = self
+            .conn
+            .execute("ALTER TABLE images ADD COLUMN hash_version INTEGER", []);
+        Ok(())
     }
 
     /// Returns cached hashes if the path exists in DB and file_size + mtime still match.
@@ -46,7 +66,7 @@ impl Catalog {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT file_size, mtime_ns, content_hash, perceptual_hash
+                "SELECT file_size, mtime_ns, content_hash, perceptual_hash, hash_version
                  FROM images WHERE path = ?1",
             )
             .ok()?;
@@ -56,16 +76,20 @@ impl Catalog {
             let db_mtime: i64 = row.get(1)?;
             let content_hash: Option<Vec<u8>> = row.get(2)?;
             let perceptual_hash: Option<Vec<u8>> = row.get(3)?;
-            Ok((db_size, db_mtime, content_hash, perceptual_hash))
+            let hash_version: Option<i64> = row.get(4)?;
+            Ok((db_size, db_mtime, content_hash, perceptual_hash, hash_version))
         })
         .ok()
-        .and_then(|(db_size, db_mtime, content_hash, perceptual_hash)| {
+        .and_then(|(db_size, db_mtime, content_hash, perceptual_hash, hash_version)| {
             if db_size != disk_size as i64 || db_mtime != disk_mtime {
+                return None;
+            }
+            if hash_version != Some(HASH_VERSION) {
                 return None;
             }
             let ch = content_hash?;
             let ph = perceptual_hash?;
-            if ch.len() != 32 {
+            if ch.len() != 32 || ph.len() != PHASH_LEN {
                 return None;
             }
             let mut arr = [0u8; 32];
@@ -84,20 +108,29 @@ impl Catalog {
         perceptual_hash: &[u8],
     ) {
         let path_str = path.to_string_lossy();
+        // If the stored mtime differs the summary columns describe an older
+        // version of the file — clear them rather than letting the new mtime
+        // mark them fresh.
         let _ = self.conn.execute(
-            "INSERT INTO images (path, file_size, mtime_ns, content_hash, perceptual_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO images (path, file_size, mtime_ns, content_hash, perceptual_hash, hash_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(path) DO UPDATE SET
+                width = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.width ELSE NULL END,
+                height = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.height ELSE NULL END,
+                date_taken = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.date_taken ELSE NULL END,
+                date_modified = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.date_modified ELSE NULL END,
                 file_size = excluded.file_size,
                 mtime_ns = excluded.mtime_ns,
                 content_hash = excluded.content_hash,
-                perceptual_hash = excluded.perceptual_hash",
+                perceptual_hash = excluded.perceptual_hash,
+                hash_version = excluded.hash_version",
             params![
                 path_str.as_ref(),
                 file_size as i64,
                 mtime_ns,
                 &content_hash[..],
                 perceptual_hash,
+                HASH_VERSION,
             ],
         );
     }
@@ -165,6 +198,9 @@ impl Catalog {
             "INSERT INTO images (path, file_size, mtime_ns, width, height, date_taken, date_modified)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(path) DO UPDATE SET
+                content_hash = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.content_hash ELSE NULL END,
+                perceptual_hash = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.perceptual_hash ELSE NULL END,
+                hash_version = CASE WHEN images.mtime_ns = excluded.mtime_ns THEN images.hash_version ELSE NULL END,
                 file_size = excluded.file_size,
                 mtime_ns = excluded.mtime_ns,
                 width = excluded.width,
@@ -183,25 +219,73 @@ impl Catalog {
         );
     }
 
-    /// Remove rows whose paths no longer exist on disk.
-    pub fn prune_missing(&self) {
-        let paths: Vec<String> = {
+    /// Remove rows under `folder` for files that no longer exist there.
+    /// Scoped to the scanned folder so entries for other folders (e.g. an
+    /// unmounted external drive) survive, and compared against the fresh scan
+    /// result instead of hitting the filesystem again.
+    pub fn prune_stale(&self, folder: &Path, present: &std::collections::HashSet<PathBuf>) {
+        let mut prefix = folder.to_string_lossy().into_owned();
+        if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+            prefix.push(std::path::MAIN_SEPARATOR);
+        }
+
+        let stale: Vec<String> = {
             let mut stmt = match self.conn.prepare("SELECT path FROM images") {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            stmt.query_map([], |row| row.get(0))
+            stmt.query_map([], |row| row.get::<_, String>(0))
                 .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .map(|rows| {
+                    rows.filter_map(|r| r.ok())
+                        .filter(|p| p.starts_with(&prefix) && !present.contains(Path::new(p)))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
+        if stale.is_empty() {
+            return;
+        }
 
-        for path_str in &paths {
-            if !Path::new(path_str).exists() {
-                let _ = self
-                    .conn
-                    .execute("DELETE FROM images WHERE path = ?1", params![path_str]);
+        let Ok(tx) = self.conn.unchecked_transaction() else {
+            return;
+        };
+        {
+            let Ok(mut stmt) = tx.prepare_cached("DELETE FROM images WHERE path = ?1") else {
+                return;
+            };
+            for path_str in &stale {
+                let _ = stmt.execute(params![path_str]);
             }
+        }
+        let _ = tx.commit();
+    }
+
+    /// Insert a batch of hashes in one transaction (one fsync instead of N).
+    pub fn insert_hashes_batch(&self, items: &[(PathBuf, crate::duplicates::HashResult)]) {
+        let tx = self.conn.unchecked_transaction();
+        for (path, r) in items {
+            self.insert_hashes(
+                path,
+                r.file_size,
+                r.mtime_ns,
+                &r.hashes.content_hash,
+                &r.hashes.perceptual_hash,
+            );
+        }
+        if let Ok(tx) = tx {
+            let _ = tx.commit();
+        }
+    }
+
+    /// Insert a batch of file summaries in one transaction.
+    pub fn insert_summaries_batch(&self, items: &[(PathBuf, u64, i64, FileSummary)]) {
+        let tx = self.conn.unchecked_transaction();
+        for (path, file_size, mtime_ns, summary) in items {
+            self.insert_file_summary(path, *file_size, *mtime_ns, summary);
+        }
+        if let Ok(tx) = tx {
+            let _ = tx.commit();
         }
     }
 }

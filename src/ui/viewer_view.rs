@@ -1,5 +1,5 @@
 use iced::widget::{button, container, image, row, scrollable, text, Space};
-use iced::{Color, Element, Length, Task, Theme};
+use iced::{Element, Length, Task};
 
 use crate::app::{Looky, Message};
 use crate::metadata::PhotoMetadata;
@@ -40,12 +40,18 @@ pub fn center_zoom_scroll(state: &Looky) -> Task<Message> {
     let pad_y = zoom_padding(render_h, vp_h);
 
     if let Some((anchor_x, anchor_y)) = state.viewer.zoom_anchor {
-        let rel_x = anchor_x;
-        let rel_y = anchor_y;
-        let img_x = rel_x - pad_x;
-        let img_y = rel_y - pad_y;
-        let scroll_x = (img_x + pad_x - rel_x).max(0.0);
-        let scroll_y = (img_y + pad_y - rel_y).max(0.0);
+        // Called when an animated zoom crosses 1.0: the image was fit to the
+        // viewport (scroll 0, padding at zoom 1), so keep the image point
+        // that was under the anchor fixed at the anchor.
+        let fit_pad_x = zoom_padding(fit_w, vp_w);
+        let fit_pad_y = zoom_padding(fit_h, vp_h);
+        let img_x = anchor_x - fit_pad_x;
+        let img_y = anchor_y - fit_pad_y;
+        let zoom = state.viewer.zoom_level;
+        let max_x = (render_w.max(vp_w) - vp_w).max(0.0);
+        let max_y = (render_h.max(vp_h) - vp_h).max(0.0);
+        let scroll_x = (img_x * zoom + pad_x - anchor_x).clamp(0.0, max_x);
+        let scroll_y = (img_y * zoom + pad_y - anchor_y).clamp(0.0, max_y);
 
         use iced::widget::operation::AbsoluteOffset;
         iced::widget::operation::scroll_to(
@@ -175,28 +181,7 @@ pub fn viewer_view<'a>(
     image_dims: Option<(u32, u32)>,
     viewport_width: f32,
     viewport_height: f32,
-    screensaver: bool,
 ) -> Element<'a, Message> {
-    if screensaver {
-        let handle = full_handle.or(thumb_handle);
-        let image_layer: Element<'a, Message> = if let Some(h) = handle {
-            let img = image(h.clone())
-                .content_fit(iced::ContentFit::Contain)
-                .width(Length::Fill)
-                .height(Length::Fill);
-            container(img).center(Length::Fill).into()
-        } else {
-            container(Space::new()).center(Length::Fill).into()
-        };
-        let view = container(image_layer)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(screensaver_bg_style);
-        return iced::widget::MouseArea::new(view)
-            .interaction(iced::mouse::Interaction::Hidden)
-            .into();
-    }
-
     if zoom_level > 1.0 {
         let handle = full_handle.or(thumb_handle);
         let image_layer: Element<'a, Message> = if let Some(h) = handle {
@@ -339,11 +324,4 @@ pub fn viewer_view<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
-}
-
-fn screensaver_bg_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(Color::BLACK)),
-        ..Default::default()
-    }
 }
